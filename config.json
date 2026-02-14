@@ -1,0 +1,19 @@
+{
+    "sadcaptcha_key": "beabd0ff6b4519d06301d8f549122ef4",
+    "hlr_api_key": "hlr_live_yHJP2aKCbGvQNXetrcsWgj0Z27PRUT3d",
+    "hlr_api_url": "https://hlrdeep.com/api/public/v1/hlr/check",
+    "number_api_base": "http://89.167.39.200/api",
+    "number_api_key": "rrUpihQvye9hzbaAi8pv6zRDgfr9Ts_IX9bleaYNPqs",
+    "claim_count": 10,
+    "lease_seconds": 600,
+    "max_retries": 3,
+    "request_timeout": 15,
+    "delay_min": 0.5,
+    "delay_max": 2.0,
+    "device_pool_path": "device_pool.json",
+    "device_pool_size": 50,
+    "global_rps": 10.0,
+    "global_burst": 20,
+    "ms_token_max_uses": 35,
+    "device_max_uses": 45
+}
